@@ -65,7 +65,7 @@ pub fn init_db(path: &Path) -> Result<Connection, String> {
             [],
             |row| row.get(0),
         )
-        .unwrap_or(0);
+        .map_err(|e| format!("Cannot read schema version: {e}"))?;
 
     for (i, migration) in MIGRATIONS.iter().enumerate() {
         let ver = (i + 1) as i64;

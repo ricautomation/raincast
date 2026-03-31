@@ -3,7 +3,7 @@ import type { LayoutArchetype } from "../generation/templates";
 
 export type AiProviderId = "gemini" | "anthropic";
 
-export type QueryIntent = "chat" | "build_app" | "edit_app" | "generate_logo";
+export type QueryIntent = "chat" | "build_app" | "edit_app" | "generate_logo" | "unsupported";
 
 export interface QueryDecision {
   intent: QueryIntent;
@@ -39,6 +39,14 @@ export interface BackendCommand {
   extraCrates?: string[];
 }
 
+/** Window configuration chosen by the AI based on app type. */
+export interface WindowConfig {
+  /** Window width in pixels (e.g. 400 for a utility, 1200 for a dashboard). */
+  width: number;
+  /** Window height in pixels (e.g. 300 for a widget, 800 for a full app). */
+  height: number;
+}
+
 /** Lightweight build plan — just structure, no code content. */
 export interface BuildPlan {
   checkpoints: Array<{
@@ -48,6 +56,8 @@ export interface BuildPlan {
   }>;
   /** Rust backend commands needed for OS/system interaction. */
   backendCommands?: BackendCommand[];
+  /** Window size — the AI chooses dimensions that fit the app's purpose. */
+  window?: WindowConfig;
 }
 
 /** Files generated for a single checkpoint. */
@@ -197,7 +207,7 @@ export interface AiProvider {
   investigateErrors(args: InvestigateErrorsArgs): Promise<{ plan: InvestigationPlan; rawResponse: string }>;
   /** Diagnostic-driven fix phase 2: AI produces patches given gathered context. */
   diagnosticFix(args: DiagnosticFixArgs): Promise<{ plan: FixPlan; rawResponse: string }>;
-  suggestAppNames(args: { messages: ChatMessage[] }): Promise<string[]>;
+  suggestAppNames(args: { messages: ChatMessage[] }): Promise<{ autoDetected: string | null; suggestions: string[] }>;
   generateLogos(args: { messages: ChatMessage[]; appName: string }): Promise<string[]>;
   refineLogos(args: { messages: ChatMessage[]; appName: string; currentSvg: string; instructions: string }): Promise<string[]>;
   /** Raw generation — send system + user prompt, get text back. Used by the agent loop. */

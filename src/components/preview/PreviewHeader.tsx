@@ -1,4 +1,4 @@
-import { Monitor, CodeXml, Rocket, ExternalLink, Loader2 } from "lucide-react";
+import { Monitor, CodeXml, Rocket, Loader2 } from "lucide-react";
 
 export type ShipState = "idle" | "shipping" | "fixing" | "shipped" | "error";
 
@@ -7,12 +7,13 @@ interface Props {
   onTabChange: (tab: "ui" | "code") => void;
   canShip: boolean;
   shipState: ShipState;
+  hasShippedBefore: boolean;
   onShip: () => void;
   onOpenApp: () => void;
 }
 
 export default function PreviewHeader({
-  activeTab, onTabChange, canShip, shipState, onShip, onOpenApp,
+  activeTab, onTabChange, canShip, shipState, hasShippedBefore, onShip, onOpenApp,
 }: Props) {
   return (
     <div className="px-4 py-2.5 flex items-center justify-between">
@@ -24,27 +25,26 @@ export default function PreviewHeader({
         {/* Ship / Open buttons */}
         {canShip && (
           <div className="flex items-center gap-1.5">
-            {/* Open — stays visible after successful ship */}
-            {shipState === "shipped" && (
+            {/* Open — always visible once app has been shipped at least once */}
+            {hasShippedBefore && (
               <button
                 onClick={onOpenApp}
                 title="Launch your app"
-                className="flex items-center gap-1.5 rounded-lg"
                 style={{
-                  padding: "4px 10px",
+                  padding: "4px 8px",
                   border: "none",
                   cursor: "pointer",
                   fontSize: 12,
                   fontWeight: 500,
-                  background: "rgba(42, 170, 136, 0.12)",
-                  color: "#2a8",
-                  transition: "background 150ms ease",
+                  background: "var(--btn-muted-bg)",
+                  color: "var(--text-tertiary)",
+                  borderRadius: 8,
+                  transition: "color 150ms ease, background 150ms ease",
                 }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(42, 170, 136, 0.2)"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(42, 170, 136, 0.12)"; }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = "var(--text-primary)"; e.currentTarget.style.background = "var(--hover-bg)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-tertiary)"; e.currentTarget.style.background = "var(--btn-muted-bg)"; }}
               >
-                <ExternalLink size={13} strokeWidth={1.8} />
-                <span>Open</span>
+                Open
               </button>
             )}
 

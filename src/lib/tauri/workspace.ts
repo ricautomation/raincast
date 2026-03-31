@@ -98,8 +98,9 @@ export async function readProjectSourceFiles(
       } else if (/\.(tsx?|css|rs)$/.test(entry.name)) {
         try {
           result[fullPath] = await readProjectFile(projectId, fullPath);
-        } catch {
-          // skip unreadable files
+        } catch (err) {
+          console.warn(`[readProjectSourceFiles] Skipped unreadable file ${fullPath}:`, err);
+          result[fullPath] = `// [ERROR: Could not read this file: ${err instanceof Error ? err.message : String(err)}]`;
         }
       }
     }
@@ -179,11 +180,25 @@ export interface SystemInfo {
 }
 
 let _cachedSystemInfo: SystemInfo | null = null;
+let _systemInfoError: Error | null = null;
+const SYSTEM_INFO_RETRY_MS = 30_000;
+let _systemInfoErrorAt = 0;
 
 export async function getSystemInfo(): Promise<SystemInfo> {
   if (_cachedSystemInfo) return _cachedSystemInfo;
-  _cachedSystemInfo = await invoke<SystemInfo>("get_system_info");
-  return _cachedSystemInfo;
+  // Avoid thundering herd: if we recently failed, throw cached error
+  if (_systemInfoError && Date.now() - _systemInfoErrorAt < SYSTEM_INFO_RETRY_MS) {
+    throw _systemInfoError;
+  }
+  try {
+    _cachedSystemInfo = await invoke<SystemInfo>("get_system_info");
+    _systemInfoError = null;
+    return _cachedSystemInfo;
+  } catch (err) {
+    _systemInfoError = err instanceof Error ? err : new Error(String(err));
+    _systemInfoErrorAt = Date.now();
+    throw _systemInfoError;
+  }
 }
 
 // ── Code Editor Detection ──
@@ -217,6 +232,10 @@ export async function shipProject(projectId: string, appName?: string): Promise<
   return invoke<void>("ship_project", { projectId, appName: appName || null });
 }
 
+export async function hasShippedApp(projectId: string): Promise<boolean> {
+  return invoke<boolean>("has_shipped_app", { projectId });
+}
+
 export async function launchShippedApp(projectId: string): Promise<void> {
   return invoke<void>("launch_shipped_app", { projectId });
 }
@@ -247,23 +266,24 @@ export async function getPreviewLogs(projectId: string): Promise<PreviewLogs> {
   return invoke<PreviewLogs>("get_preview_logs", { projectId });
 }
 
-// ── Blue-Engine ──
+// ── Dev Proxy ──
 
-export interface BlueEngineInfo {
-  port: number;
-  invoke_key: string;
-  commands: string[];
-}
-
-export async function startBlueEngine(
+/** Build the proxy binary for dev-mode command execution. */
+export async function buildProxyBinary(
   projectId: string,
-  port?: number,
-): Promise<BlueEngineInfo> {
-  return invoke<BlueEngineInfo>("start_blue_engine", { projectId, port: port ?? null });
+  mainRs: string,
+  cargoToml: string,
+): Promise<string> {
+  return invoke<string>("build_proxy_binary", { projectId, mainRs, cargoToml });
 }
 
-export async function stopBlueEngine(projectId: string): Promise<void> {
-  return invoke<void>("stop_blue_engine", { projectId });
+/** Execute a command via the project's proxy binary. */
+export async function proxyTauri(
+  projectId: string,
+  command: string,
+  args: unknown,
+): Promise<unknown> {
+  return invoke<unknown>("proxy_tauri", { projectId, command, args: args ?? {} });
 }
 
 /** Check if a project has a generated app on disk (survives restarts). */
@@ -309,4 +329,9 @@ export async function renameAppInSource(projectId: string, newName: string): Pro
 /** Cancel an in-progress ship build. */
 export async function cancelShip(projectId: string): Promise<void> {
   return invoke<void>("cancel_ship", { projectId });
+}
+
+/** Capture a screenshot of a screen region. Returns base64 PNG. */
+export async function captureScreenshot(x: number, y: number, width: number, height: number): Promise<string> {
+  return invoke<string>("capture_screenshot", { x, y, width, height });
 }

@@ -9,7 +9,7 @@ import {
   dbSaveMessages,
   dbSetSetting,
 } from "../tauri/db";
-import { loadAppIcon } from "../tauri/workspace";
+import { loadAppIcon, stopPreviewServer } from "../tauri/workspace";
 
 export interface Project {
   id: string;
@@ -100,13 +100,19 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     dbLoadAll().then(async (result) => {
-      let loadedProjects: Project[] = result.projects.map((p) => ({
-        id: p.id,
-        title: p.title,
-        messages: p.messages,
-        createdAt: p.createdAt,
-        open: p.isOpen,
-      }));
+      let loadedProjects: Project[];
+      try {
+        loadedProjects = result.projects.map((p) => ({
+          id: p.id,
+          title: p.title,
+          messages: p.messages,
+          createdAt: p.createdAt,
+          open: p.isOpen,
+        }));
+      } catch (mapErr) {
+        console.error("[ProjectCtx] Failed to map projects:", mapErr);
+        throw mapErr; // let .catch() handle fallback
+      }
 
       // If no projects, create a default one
       if (loadedProjects.length === 0) {
@@ -125,11 +131,19 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       setLoaded(true);
     }).catch((e) => {
       console.error("[ProjectCtx] Failed to load from DB:", e);
-      // Fallback: create in-memory project (DB may not be available during dev)
+      // Fallback: create in-memory project. Try to persist it to DB so it survives restart.
       const fallbackId = crypto.randomUUID();
-      setProjects([{ id: fallbackId, title: "App #1", messages: [], createdAt: Date.now(), open: true }]);
+      const fallbackProject = { id: fallbackId, title: "App #1", messages: [] as ChatMessage[], createdAt: Date.now(), open: true };
+      setProjects([fallbackProject]);
       setActiveId(fallbackId);
       setLoaded(true);
+      // Best-effort: persist the fallback project to DB so it's not orphaned on restart
+      dbCreateProject("App #1").then((dbId) => {
+        setProjects([{ ...fallbackProject, id: dbId }]);
+        setActiveId(dbId);
+      }).catch(() => {
+        console.warn("[ProjectCtx] Could not persist fallback project to DB — data may be lost on restart");
+      });
     });
   }, []);
 
@@ -147,7 +161,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
             prev.map((proj) => (proj.id === p.id ? { ...proj, icon: dataUrl } : proj)),
           );
         }
-      }).catch(() => {});
+      }).catch((err) => {
+          console.warn(`[ProjectContext] Failed to load icon for ${p.id}:`, err);
+        });
     }
   }, [loaded, projects]);
 
@@ -157,7 +173,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (activeId && activeId !== prevActiveId.current) {
       prevActiveId.current = activeId;
-      dbSetSetting("active_project_id", activeId).catch(() => {});
+      dbSetSetting("active_project_id", activeId).catch((err) => {
+        console.warn("[ProjectContext] Failed to persist active project ID:", err);
+      });
     }
   }, [activeId]);
 
@@ -183,7 +201,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       prev.map((p) => (p.id === id ? { ...p, open: true } : p)),
     );
     setActiveId(id);
-    dbSetProjectOpen(id, true).catch(() => {});
+    dbSetProjectOpen(id, true).catch((err) => {
+      console.warn(`[ProjectContext] Failed to persist open state for ${id}:`, err);
+    });
   }, []);
 
   const closeProject = useCallback((id: string) => {
@@ -197,50 +217,76 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       const remaining = projectsRef.current.filter((p) => p.open && p.id !== id);
       return remaining.length > 0 ? remaining[remaining.length - 1].id : prevActive;
     });
-    dbSetProjectOpen(id, false).catch(() => {});
+    dbSetProjectOpen(id, false).catch((err) => {
+      console.warn(`[ProjectContext] Failed to persist close state for ${id}:`, err);
+    });
   }, []);
 
   const deleteProject = useCallback((id: string) => {
     if (!id) return;
 
-    // Remove from dirty set so flushDirty doesn't try to save it
-    dirtyProjects.current.delete(id);
-
-    // Remove from DB (cascade deletes messages + images)
-    dbDeleteProject(id).catch(() => {});
-
-    setProjects((prev) => prev.filter((p) => p.id !== id));
-
-    // If we deleted the active project, create a fresh one (like "New Project")
-    setActiveId((prevActive) => {
-      if (prevActive !== id) return prevActive;
-      const remaining = projectsRef.current.filter((p) => p.id !== id);
-      const nextNum = remaining.length + 1;
-      const freshTitle = `App #${nextNum}`;
-      dbCreateProject(freshTitle).then((freshId) => {
-        setProjects((cur) => [
-          ...cur,
-          { id: freshId, title: freshTitle, messages: [], createdAt: Date.now(), open: true },
-        ]);
-        setActiveId(freshId);
+    try {
+      // Stop preview server for this project (fire-and-forget)
+      stopPreviewServer(id).catch((err) => {
+        console.warn(`[deleteProject] Failed to stop preview server for ${id}:`, err);
       });
-      return prevActive;
-    });
-  }, []);
+
+      // Remove from dirty set so flushDirty doesn't try to save it
+      dirtyProjects.current.delete(id);
+
+      // Remove from DB (cascade deletes messages + images)
+      dbDeleteProject(id).catch((err) => {
+        console.warn(`[deleteProject] Failed to delete project ${id} from DB:`, err);
+      });
+
+      const remaining = projectsRef.current.filter((p) => p.id !== id);
+
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+
+      // If we deleted the active project, always create a fresh new project
+      if (id === activeId) {
+        const nextNum = remaining.length + 1;
+        const freshTitle = `App #${nextNum}`;
+        dbCreateProject(freshTitle)
+          .then((freshId) => {
+            setProjects((cur) => [
+              ...cur,
+              { id: freshId, title: freshTitle, messages: [], createdAt: Date.now(), open: true },
+            ]);
+            setActiveId(freshId);
+          })
+          .catch(() => {
+            const fallbackId = crypto.randomUUID();
+            setProjects((cur) => [
+              ...cur,
+              { id: fallbackId, title: "App #1", messages: [], createdAt: Date.now(), open: true },
+            ]);
+            setActiveId(fallbackId);
+          });
+      }
+    } catch {
+      // Never crash the app on delete
+      console.warn("[deleteProject] Error during cleanup — ignored");
+    }
+  }, [activeId]);
 
   const reopenProject = useCallback((id: string) => {
     setProjects((prev) =>
       prev.map((p) => (p.id === id ? { ...p, open: true } : p)),
     );
     setActiveId(id);
-    dbSetProjectOpen(id, true).catch(() => {});
+    dbSetProjectOpen(id, true).catch((err) => {
+      console.warn(`[ProjectContext] Failed to persist reopen state for ${id}:`, err);
+    });
   }, []);
 
   const renameProject = useCallback((id: string, title: string) => {
     setProjects((prev) =>
       prev.map((p) => (p.id === id ? { ...p, title } : p)),
     );
-    dbRenameProject(id, title).catch(() => {});
+    dbRenameProject(id, title).catch((err) => {
+      console.warn(`[ProjectContext] Failed to persist rename for ${id}:`, err);
+    });
   }, []);
 
   const setProjectIcon = useCallback((id: string, iconDataUrl: string) => {

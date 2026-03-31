@@ -13,6 +13,7 @@ interface ProjectGenState {
   isRunning: boolean;
   hasProject: boolean;
   generationLogs: string[];
+  rustAgentLogs: string[];
   history: string[];
   cursor: number;
 }
@@ -22,6 +23,7 @@ const INITIAL_PROJECT_STATE: ProjectGenState = {
   isRunning: false,
   hasProject: false,
   generationLogs: [],
+  rustAgentLogs: [],
   history: [],
   cursor: -1,
 };
@@ -67,6 +69,7 @@ export function useGeneration(runtimeErrorsRef?: React.RefObject<(() => string[]
     layoutArchetype?: LayoutArchetype,
     onToolStatus?: (status: { text: string; tool?: string; args?: string } | null) => void,
     onProjectRenamed?: (newName: string) => void,
+    onToolResult?: (toolName: string, result: string) => void,
     scaffoldTier?: ScaffoldTier,
   ) => {
     const providerId = getActiveProviderId();
@@ -85,6 +88,7 @@ export function useGeneration(runtimeErrorsRef?: React.RefObject<(() => string[]
     // Clear logs for new generation
     updateProject(projectId, () => ({
       generationLogs: [],
+      rustAgentLogs: [],
       isRunning: true,
       status: { phase: "planning", message: reason ?? "Analyzing requirements..." },
     }));
@@ -123,7 +127,13 @@ export function useGeneration(runtimeErrorsRef?: React.RefObject<(() => string[]
       onChatStatusAppend: onChatStatusAppend ?? undefined,
       onToolStatus: onToolStatus ?? undefined,
       onProjectRenamed: onProjectRenamed ?? undefined,
+      onToolResult: onToolResult ?? undefined,
       getRuntimeErrors: runtimeErrorsRef ? () => (runtimeErrorsRef.current?.() ?? []) : undefined,
+      onRustLog: (line) => {
+        updateProject(projectId, (prev) => ({
+          rustAgentLogs: [...prev.rustAgentLogs, line],
+        }));
+      },
       onFirstCheckpointApplied: () => {
         updateProject(projectId, () => ({ hasProject: true }));
         onFirstCheckpointRefs.current[projectId]?.();
@@ -132,13 +142,24 @@ export function useGeneration(runtimeErrorsRef?: React.RefObject<(() => string[]
 
     sessionsRef.current[projectId] = session;
 
-    session.run().then(() => {
+    session.run().catch((err) => {
+      // Escaped the session's own try-catch — log and surface to user
+      console.error("[session.run] unhandled rejection:", err);
+      updateProject(projectId, () => ({
+        status: {
+          phase: "failed",
+          error: { title: "Generation failed", detail: err instanceof Error ? err.message : String(err) },
+        },
+      }));
+    }).finally(() => {
       if (sessionsRef.current[projectId] === session) {
         updateProject(projectId, () => ({ isRunning: false }));
         // Persist generation logs to disk
         const logs = (projectsRef.current[projectId] ?? INITIAL_PROJECT_STATE).generationLogs;
         if (logs.length > 0) {
-          saveGenerationLogs(projectId, logs).catch(() => {});
+          saveGenerationLogs(projectId, logs).catch((err) => {
+            console.error(`[useGeneration] Failed to save generation logs for ${projectId}:`, err);
+          });
         }
       }
     });
@@ -226,7 +247,9 @@ export function useGeneration(runtimeErrorsRef?: React.RefObject<(() => string[]
           ...(logs.length > 0 ? { generationLogs: logs } : {}),
         }));
       }
-    }).catch(() => {}); // ignore errors (e.g. invalid ID)
+    }).catch((err) => {
+      console.error(`[useGeneration] checkProjectHasApp failed for ${projectId}:`, err);
+    });
   }, [updateProject]);
 
   return { getProject, start, cancel, undoLast, redoNext, checkHasProject };

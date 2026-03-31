@@ -6,6 +6,7 @@ import { PreviewProvider } from "./lib/preview/PreviewContext";
 import { ProjectProvider } from "./lib/project/ProjectContext";
 import { SketchProvider } from "./lib/sketch/SketchContext";
 import ErrorBoundary from "./components/ErrorBoundary";
+import Onboarding, { needsOnboarding } from "./components/Onboarding";
 import TopTabsBar from "./components/TopTabsBar";
 import SplitWorkspace from "./components/SplitWorkspace";
 import PreviewPane from "./components/preview";
@@ -70,6 +71,8 @@ function OfflineOverlay() {
 }
 
 function App() {
+  const [showOnboarding, setShowOnboarding] = useState(needsOnboarding);
+
   return (
     <ThemeProvider>
       <ProjectProvider>
@@ -90,6 +93,9 @@ function App() {
               />
             </div>
             <OfflineOverlay />
+            {showOnboarding && (
+              <Onboarding onDone={() => setShowOnboarding(false)} />
+            )}
             </ErrorBoundary>
           </SketchProvider>
           </PreviewProvider>

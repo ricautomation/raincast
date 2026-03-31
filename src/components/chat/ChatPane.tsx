@@ -1,4 +1,4 @@
-import { useRef, useCallback, useState, useEffect } from "react";
+import { useRef, useCallback, useState, useEffect, useMemo } from "react";
 import { SquarePen, ChevronDown } from "lucide-react";
 import ProviderSelector from "./ProviderSelector";
 import UserBubble from "./UserBubble";
@@ -110,7 +110,12 @@ function toPngBase64(src: string, size: number): Promise<string> {
       const canvas = document.createElement("canvas");
       canvas.width = size;
       canvas.height = size;
-      const ctx = canvas.getContext("2d")!;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        if (blobUrl) URL.revokeObjectURL(blobUrl);
+        reject(new Error("Failed to get canvas 2d context"));
+        return;
+      }
       ctx.drawImage(img, 0, 0, size, size);
       if (blobUrl) URL.revokeObjectURL(blobUrl);
       // Force RGBA: WebKit may produce RGB PNG when all pixels are opaque (e.g. from JPEG).
@@ -122,7 +127,7 @@ function toPngBase64(src: string, size: number): Promise<string> {
       }
       const dataUrl = canvas.toDataURL("image/png");
       // Strip the "data:image/png;base64," prefix
-      resolve(dataUrl.split(",")[1]);
+      resolve(dataUrl.split(",")[1] ?? "");
     };
     img.onerror = () => {
       if (blobUrl) URL.revokeObjectURL(blobUrl);
@@ -215,11 +220,22 @@ interface ToolStatus {
   seq: number;
 }
 
+/** Tool result data for animation */
+interface ToolResultAnim {
+  tool: string;
+  lines: string[];
+  /** For edit_file: the search and replace strings */
+  search?: string;
+  replace?: string;
+  seq: number;
+}
+
 /** Per-project ephemeral UI state (thinking, streaming, tool status) */
 interface TabState {
   thinking: boolean;
   streamingId: string | null;
   toolStatus: ToolStatus | null;
+  toolResultAnim: ToolResultAnim | null;
 }
 
 /** Hook that reveals a string character by character (typewriter). */
@@ -239,8 +255,92 @@ function useTypewriter(text: string, speed = 18): string {
   return text.slice(0, shown);
 }
 
+/** Scrolling tool result animation — lines scroll upward with fade-out at top */
+function ToolResultAnimation({ anim }: { anim: ToolResultAnim }) {
+  const [lineIdx, setLineIdx] = useState(0);
+  const LINE_H = 20;
+  const VISIBLE = 3;
+
+  const displayLines = useMemo(() => {
+    if (anim.tool === "edit_file" && anim.search && anim.replace) {
+      return [
+        ...anim.search.split("\n").map((l) => ({ text: l, type: "search" as const })),
+        ...anim.replace.split("\n").map((l) => ({ text: l, type: "replace" as const })),
+      ];
+    }
+    return anim.lines.map((l) => ({ text: l, type: "neutral" as const }));
+  }, [anim.tool, anim.search, anim.replace, anim.lines]);
+
+  useEffect(() => {
+    setLineIdx(0);
+    if (displayLines.length === 0) return;
+    const speed = Math.max(100, Math.min(250, 5000 / displayLines.length));
+    let i = 0;
+    const id = setInterval(() => {
+      i++;
+      if (i >= displayLines.length) { clearInterval(id); return; }
+      setLineIdx(i);
+    }, speed);
+    return () => clearInterval(id);
+  }, [anim.seq, displayLines.length]);
+
+  if (displayLines.length === 0) return null;
+
+  const containerH = Math.min(VISIBLE, displayLines.length) * LINE_H;
+  const scrollOff = Math.max(0, lineIdx - VISIBLE + 1) * LINE_H;
+  const showMask = lineIdx >= VISIBLE;
+
+  return (
+    <div style={{
+      marginTop: 4,
+      borderRadius: 6,
+      background: "var(--input-bg)",
+      border: "1px solid var(--separator-color)",
+      height: containerH,
+      overflow: "hidden",
+      position: "relative",
+      maskImage: showMask ? "linear-gradient(to bottom, transparent 0%, black 40%, black 100%)" : undefined,
+      WebkitMaskImage: showMask ? "linear-gradient(to bottom, transparent 0%, black 40%, black 100%)" : undefined,
+    }}>
+      <div style={{
+        transform: `translateY(-${scrollOff}px)`,
+        transition: "transform 0.35s ease-out",
+      }}>
+        {displayLines.map((line, i) => {
+          const bg = line.type === "search" ? "rgba(220,60,60,0.06)"
+            : line.type === "replace" ? "rgba(42,170,100,0.06)"
+            : "transparent";
+          const color = line.type === "search" ? "#c66"
+            : line.type === "replace" ? "#5a9"
+            : "var(--text-tertiary)";
+          const prefix = line.type === "search" ? "−" : line.type === "replace" ? "+" : "";
+          return (
+            <div key={i} style={{
+              height: LINE_H,
+              lineHeight: `${LINE_H}px`,
+              padding: "0 10px",
+              fontSize: 11,
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+              color,
+              background: bg,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              opacity: i <= lineIdx ? 1 : 0,
+              transition: "opacity 0.25s ease",
+            }}>
+              {prefix && <span style={{ opacity: 0.5, marginRight: 6 }}>{prefix}</span>}
+              {line.text || "\u00A0"}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /** Animated tool call status shown in chat during the agent loop. */
-function ToolCallStatus({ status }: { status: ToolStatus }) {
+function ToolCallStatus({ status, resultAnim }: { status: ToolStatus; resultAnim: ToolResultAnim | null }) {
   const visibleText = useTypewriter(status.text || "", 18);
   const toolLabel = status.tool ? `${status.tool}(${status.args || ""})` : "";
   const visibleTool = useTypewriter(toolLabel, 12);
@@ -252,12 +352,16 @@ function ToolCallStatus({ status }: { status: ToolStatus }) {
       animation: "toolStatusSlideIn 0.3s ease-out",
     }}>
       {status.text && (
-        <div style={{
-          fontSize: 12.5,
-          color: "var(--text-secondary)",
-          marginBottom: status.tool ? 5 : 0,
-          fontWeight: 500,
-        }}>
+        <div
+          onClick={() => window.dispatchEvent(new CustomEvent("raincast:switch-to-code"))}
+          style={{
+            fontSize: 12.5,
+            color: "var(--text-secondary)",
+            marginBottom: status.tool ? 5 : 0,
+            fontWeight: 500,
+            cursor: "pointer",
+          }}
+        >
           {visibleText}
         </div>
       )}
@@ -283,6 +387,7 @@ function ToolCallStatus({ status }: { status: ToolStatus }) {
           {" "}{visibleTool}
         </div>
       )}
+      {resultAnim && <ToolResultAnimation anim={resultAnim} />}
     </div>
   );
 }
@@ -294,12 +399,13 @@ export default function ChatPane() {
   const [activeProviderId, setActiveProviderState] = useState(getActiveProviderId);
   const [inputValue, setInputValue] = useState("");
   const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([]);
+  const [attachedErrors, setAttachedErrors] = useState<string[]>([]);
 
   // Per-tab UI state stored in a map so tabs don't interfere
   const [tabStates, setTabStates] = useState<Record<string, TabState>>({});
 
   const { status, isRunning, hasProject, start, cancel } = useGenerationContext();
-  const { startPreview, previewUrl, overlayText: previewOverlay } = usePreviewContext();
+  const { startPreview, previewUrl, overlayText: previewOverlay, isUserStopped } = usePreviewContext();
   const { active, activeId, createProject, updateMessages, renameProject, setProjectIcon } = useProjectContext();
   const { pendingInsert, consumeInsert } = useSketchContext();
   const prevPhaseRef = useRef(status.phase);
@@ -311,6 +417,38 @@ export default function ChatPane() {
       consumeInsert();
     }
   }, [pendingInsert, consumeInsert]);
+
+  // Listen for error insertion from the preview pane
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const error = (e as CustomEvent).detail?.error;
+      if (typeof error === "string" && error.trim()) {
+        setAttachedErrors((prev) => {
+          // Avoid duplicates
+          if (prev.includes(error)) return prev;
+          return [...prev, error];
+        });
+      }
+    };
+    window.addEventListener("raincast:insert-error", handler);
+    return () => window.removeEventListener("raincast:insert-error", handler);
+  }, []);
+
+  const removeAttachedError = useCallback((index: number) => {
+    setAttachedErrors((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  // Listen for screenshot insertion from the preview pane
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent).detail;
+      if (d?.base64 && d?.dataUrl) {
+        setPendingImages((prev) => [...prev, { mime: d.mime || "image/png", base64: d.base64, dataUrl: d.dataUrl }]);
+      }
+    };
+    window.addEventListener("raincast:insert-screenshot", handler);
+    return () => window.removeEventListener("raincast:insert-screenshot", handler);
+  }, []);
 
   // Save & restore scroll position per tab
   const scrollPositions = useRef<Record<string, number>>({});
@@ -340,8 +478,9 @@ export default function ChatPane() {
   const thinking = tabState?.thinking ?? false;
   const streamingId = tabState?.streamingId ?? null;
   const toolStatus = tabState?.toolStatus ?? null;
+  const toolResultAnim = tabState?.toolResultAnim ?? null;
 
-  const defaultTab = { thinking: false, streamingId: null, toolStatus: null };
+  const defaultTab = { thinking: false, streamingId: null, toolStatus: null, toolResultAnim: null as ToolResultAnim | null };
 
   // Helpers to update a specific tab's state
   const setTabThinking = useCallback((tabId: string, value: boolean) => {
@@ -360,17 +499,42 @@ export default function ChatPane() {
 
   const toolStatusSeq = useRef(0);
   const lastToolStatusText = useRef<Record<string, string | null>>({});
+  const lastToolArgsRef = useRef<Record<string, string | undefined>>({});
   const setTabToolStatus = useCallback((tabId: string, value: { text: string; tool?: string; args?: string } | null) => {
     const newText = value?.text ?? null;
     const prevText = lastToolStatusText.current[tabId] ?? null;
     // Skip update if text is identical — avoids re-triggering the slide-in animation
     if (newText === prevText) return;
     lastToolStatusText.current[tabId] = newText;
+    lastToolArgsRef.current[tabId] = value?.args;
     toolStatusSeq.current++;
     const seq = toolStatusSeq.current;
     setTabStates((prev) => ({
       ...prev,
-      [tabId]: { ...(prev[tabId] ?? defaultTab), toolStatus: value ? { ...value, seq } : null },
+      [tabId]: { ...(prev[tabId] ?? defaultTab), toolStatus: value ? { ...value, seq } : null, ...(value === null ? { toolResultAnim: null } : {}) },
+    }));
+  }, []);
+
+  const toolResultSeq = useRef(0);
+  const handleToolResult = useCallback((tabId: string, toolName: string, result: string) => {
+    toolResultSeq.current++;
+    const seq = toolResultSeq.current;
+    const lines = result.split("\n").filter((l) => l.trim()).slice(0, 200);
+
+    let search: string | undefined;
+    let replace: string | undefined;
+
+    if (toolName === "edit_file") {
+      try {
+        const args = JSON.parse(lastToolArgsRef.current[tabId] ?? "{}");
+        search = args.search;
+        replace = args.replace;
+      } catch { /* ignore */ }
+    }
+
+    setTabStates((prev) => ({
+      ...prev,
+      [tabId]: { ...(prev[tabId] ?? defaultTab), toolResultAnim: { tool: toolName, lines, search, replace, seq } },
     }));
   }, []);
 
@@ -392,21 +556,31 @@ export default function ChatPane() {
   }, [createProject]);
 
   const handleSend = useCallback(async () => {
-    if ((!inputValue.trim() && pendingImages.length === 0) || !provider || thinking) return;
+    if ((!inputValue.trim() && pendingImages.length === 0 && attachedErrors.length === 0) || !provider || thinking) return;
 
     // Capture the project ID at send time so async callbacks target the right project
     const sendProjectId = activeId;
 
+    // Build content: user text + any attached console errors
+    let content = inputValue.trim();
+    if (attachedErrors.length > 0) {
+      const errorBlock = attachedErrors.join("\n");
+      content = content
+        ? `${content}\n\nConsole errors from the app:\n\`\`\`\n${errorBlock}\n\`\`\``
+        : `The app is showing these console errors — please fix them:\n\`\`\`\n${errorBlock}\n\`\`\``;
+    }
+
     const userMsg: ChatMessage = {
       id: String(Date.now()),
       role: "user",
-      content: inputValue.trim(),
+      content,
       ...(pendingImages.length > 0 ? { images: pendingImages } : {}),
     };
     const updated = [...messages, userMsg];
     updateMessages(sendProjectId, updated);
     setInputValue("");
     setPendingImages([]);
+    setAttachedErrors([]);
     setTabThinking(sendProjectId, true);
 
     const appendAssistant = (content: string) => {
@@ -481,37 +655,49 @@ export default function ChatPane() {
             start(activeId, allMessages, "build", "Building your app...", undefined, handleChatStatus, handleChatStatusAppend, decision.layoutArchetype,
               (s) => setTabToolStatus(sendProjectId, s),
               undefined,
+              (toolName, result) => handleToolResult(sendProjectId, toolName, result),
               decision.needsBackend ? "system" : "standard",
             );
 
             // Generate name + logos in parallel with the build
-            provider.suggestAppNames({ messages: updated }).then((names) => {
-              if (names.length > 0) {
+            provider.suggestAppNames({ messages: updated }).then(({ autoDetected, suggestions }) => {
+              let appName: string;
+
+              if (autoDetected) {
+                // User already named the app — apply it directly, no picker needed
+                appName = autoDetected;
+                renameProject(sendProjectId, appName);
+              } else if (suggestions.length > 0) {
+                // No name detected — show picker for user to choose
                 const pickerMsg: ChatMessage = {
                   id: `name-picker-${Date.now()}`,
                   role: "status",
                   content: "Pick a name for your app",
                   statusData: {
                     type: "name-picker",
-                    nameSuggestions: names,
+                    nameSuggestions: suggestions,
                   },
                 };
                 updateMessages(sendProjectId, (prev) => [...prev, pickerMsg]);
-
-                // Generate logos (3 variants already run in parallel via Promise.all)
-                const appName = names[0];
-                provider.generateLogos({ messages: updated, appName }).then((svgs) => {
-                  if (svgs.length > 0) {
-                    const logoMsg: ChatMessage = {
-                      id: `logo-picker-${Date.now()}`,
-                      role: "status",
-                      content: "Pick a logo",
-                      statusData: { type: "logo-picker", logoSvgs: svgs },
-                    };
-                    updateMessages(sendProjectId, (prev) => [...prev, logoMsg]);
-                  }
-                });
+                appName = suggestions[0];
+              } else {
+                return; // No names at all — skip logos too
               }
+
+              // Generate logos using the chosen/first name
+              return provider.generateLogos({ messages: updated, appName }).then((svgs) => {
+                if (svgs.length > 0) {
+                  const logoMsg: ChatMessage = {
+                    id: `logo-picker-${Date.now()}`,
+                    role: "status",
+                    content: "Pick a logo",
+                    statusData: { type: "logo-picker", logoSvgs: svgs },
+                  };
+                  updateMessages(sendProjectId, (prev) => [...prev, logoMsg]);
+                }
+              });
+            }).catch((err) => {
+              console.error("[ChatPane] Name/logo generation failed:", err);
             });
           }
           break;
@@ -530,6 +716,7 @@ export default function ChatPane() {
             start(activeId, allMessages, "edit", "Applying edits...", undefined, handleChatStatus, handleChatStatusAppend, undefined,
               (s) => setTabToolStatus(sendProjectId, s),
               (name) => renameProject(sendProjectId, name),
+              (toolName, result) => handleToolResult(sendProjectId, toolName, result),
             );
           }
           break;
@@ -567,6 +754,11 @@ export default function ChatPane() {
           break;
         }
 
+        case "unsupported": {
+          appendAssistant(decision.message);
+          break;
+        }
+
         default: {
           appendAssistant(decision.message);
           break;
@@ -575,7 +767,7 @@ export default function ChatPane() {
     } catch {
       appendAssistant("Something went wrong. Please try again.");
     }
-  }, [inputValue, pendingImages, messages, isRunning, hasProject, start, provider, thinking, activeId, updateMessages, setTabThinking, setTabStreamingId, setTabToolStatus]);
+  }, [inputValue, pendingImages, attachedErrors, messages, isRunning, hasProject, start, provider, thinking, activeId, updateMessages, setTabThinking, setTabStreamingId, setTabToolStatus]);
 
   // Safety net: clear thinking + tool status when generation finishes
   const wasRunning = useRef(false);
@@ -610,15 +802,16 @@ export default function ChatPane() {
 
   // Auto-restart preview when the user switches to a project tab that has a workspace
   // but no running preview. Skip initial mount to avoid spamming on app launch.
+  // Also skip if the user explicitly stopped the preview (they must click play to restart).
   const initialMountRef = useRef(true);
   useEffect(() => {
     if (initialMountRef.current) {
       initialMountRef.current = false;
       return;
     }
-    if (!hasProject || previewUrl || isRunning || previewOverlay) return;
+    if (!hasProject || previewUrl || isRunning || previewOverlay || isUserStopped(activeId)) return;
     startPreview(activeId);
-  }, [activeId, hasProject, previewUrl, isRunning, previewOverlay, startPreview]);
+  }, [activeId, hasProject, previewUrl, isRunning, previewOverlay, isUserStopped, startPreview]);
 
   return (
     <div className="flex flex-col h-full rounded-xl overflow-hidden"
@@ -744,7 +937,7 @@ export default function ChatPane() {
             : <AiResponse key={msg.id} content={msg.content} isStreaming={msg.id === streamingId} />;
         })}
         {(thinking || (isRunning && !toolStatus && !streamingId)) && <AiResponse content="" isThinking />}
-        {toolStatus && <ToolCallStatus key={toolStatus.seq} status={toolStatus} />}
+        {toolStatus && <ToolCallStatus key={toolStatus.seq} status={toolStatus} resultAnim={toolResultAnim} />}
         {/* Spacer pushes last message to top of viewport so user can see responses as they arrive */}
         {hasMessages && <div style={{ minHeight: "40vh" }} />}
         <div ref={messagesEndRef} />
@@ -763,7 +956,7 @@ export default function ChatPane() {
             boxShadow: "var(--input-shadow)",
           }}
         >
-          <ChatInput value={inputValue} onChange={setInputValue} onSend={handleSend} isRunning={isRunning} onStop={() => cancel(activeId)} images={pendingImages} onImagesChange={setPendingImages} />
+          <ChatInput value={inputValue} onChange={setInputValue} onSend={handleSend} isRunning={isRunning} onStop={() => cancel(activeId)} images={pendingImages} onImagesChange={setPendingImages} attachedErrors={attachedErrors} onRemoveError={removeAttachedError} />
         </div>
       </div>
     </div>

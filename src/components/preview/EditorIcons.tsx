@@ -10,7 +10,7 @@ import zedLogo from "../../assets/editors/zed.png";
 import neovimLogo from "../../assets/editors/neovim.png";
 import intellijLogo from "../../assets/editors/intellij.png";
 import xcodeLogo from "../../assets/editors/xcode.jpg";
-import windsurfLogo from "../../assets/editors/windsurf.png";
+import antigravityLogo from "../../assets/editors/antigravity.png";
 
 // ── Image-based icon ──
 
@@ -70,7 +70,7 @@ const IMG_EDITORS: Record<string, { src: string; alt: string }> = {
   neovim: { src: neovimLogo, alt: "Neovim" },
   idea: { src: intellijLogo, alt: "IntelliJ IDEA" },
   xcode: { src: xcodeLogo, alt: "Xcode" },
-  windsurf: { src: windsurfLogo, alt: "Windsurf" },
+  antigravity: { src: antigravityLogo, alt: "Antigravity" },
 };
 
 const SVG_EDITORS: Record<string, IconComponent> = {

@@ -1,4 +1,5 @@
 import { useRef, useCallback, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { Paperclip, PenTool, ArrowUp, Square, X } from "lucide-react";
 import type { ImageAttachment } from "../../lib/chat/types";
 import { validateImageFile, fileToDataUrl, dataUrlToBase64 } from "@rain/editkit/browser";
@@ -12,6 +13,9 @@ interface Props {
   onStop?: () => void;
   images: ImageAttachment[];
   onImagesChange: (images: ImageAttachment[]) => void;
+  /** Console errors inserted from the preview pane */
+  attachedErrors: string[];
+  onRemoveError: (index: number) => void;
 }
 
 const PLACEHOLDER_HINTS = [
@@ -59,10 +63,10 @@ function useAnimatedPlaceholder() {
   return { displayed, phase };
 }
 
-export default function ChatInput({ value, onChange, onSend, isRunning, onStop, images, onImagesChange }: Props) {
+export default function ChatInput({ value, onChange, onSend, isRunning, onStop, images, onImagesChange, attachedErrors, onRemoveError }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const hasInput = value.trim().length > 0 || images.length > 0;
+  const hasInput = value.trim().length > 0 || images.length > 0 || attachedErrors.length > 0;
   const [dragOver, setDragOver] = useState(false);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const { openSketch } = useSketchContext();
@@ -95,9 +99,13 @@ export default function ChatInput({ value, onChange, onSend, isRunning, onStop, 
         console.warn("[ChatInput] Image rejected:", validation.reason);
         continue;
       }
-      const { mime, dataUrl } = await fileToDataUrl(file);
-      const { base64 } = dataUrlToBase64(dataUrl);
-      newImages.push({ mime, base64, dataUrl });
+      try {
+        const { mime, dataUrl } = await fileToDataUrl(file);
+        const { base64 } = dataUrlToBase64(dataUrl);
+        newImages.push({ mime, base64, dataUrl });
+      } catch (err) {
+        console.error("[ChatInput] Failed to read image file:", file.name, err);
+      }
     }
     if (newImages.length > 0) {
       onImagesChange([...images, ...newImages]);
@@ -171,6 +179,75 @@ export default function ChatInput({ value, onChange, onSend, isRunning, onStop, 
         borderRadius: 16,
       }}
     >
+      {/* Attached console errors */}
+      {attachedErrors.length > 0 && (
+        <div style={{ padding: "8px 12px 0", display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            paddingBottom: 2,
+          }}>
+            <div style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: "#d44",
+              flexShrink: 0,
+            }} />
+            <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-secondary)" }}>
+              Console errors ({attachedErrors.length})
+            </span>
+          </div>
+          <div style={{
+            maxHeight: 100,
+            overflowY: "auto",
+            borderRadius: 8,
+            background: "var(--btn-muted-bg)",
+            padding: "6px 8px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 2,
+          }} className="rain-scroll">
+            {attachedErrors.map((err, i) => (
+              <div key={i} style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 6,
+              }}>
+                <div style={{
+                  flex: 1,
+                  fontSize: 11,
+                  fontFamily: "var(--font-mono, monospace)",
+                  color: "#d44",
+                  lineHeight: 1.4,
+                  wordBreak: "break-word",
+                  opacity: 0.85,
+                }}>
+                  {err.length > 120 ? err.slice(0, 120) + "..." : err}
+                </div>
+                <button
+                  onClick={() => onRemoveError(i)}
+                  style={{
+                    flexShrink: 0,
+                    background: "none",
+                    border: "none",
+                    cursor: "pointer",
+                    padding: 1,
+                    color: "var(--text-tertiary)",
+                    display: "flex",
+                    marginTop: 1,
+                  }}
+                  title="Remove this error"
+                >
+                  <X size={11} strokeWidth={2.5} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Image previews */}
       {images.length > 0 && (
         <div className="px-4 pt-3 flex gap-2 flex-wrap">
@@ -315,17 +392,17 @@ export default function ChatInput({ value, onChange, onSend, isRunning, onStop, 
         )}
       </div>
 
-      {/* Lightbox preview */}
-      {previewIndex !== null && images[previewIndex] && (
+      {/* Lightbox preview — portal to body so it renders above all stacking contexts */}
+      {previewIndex !== null && images[previewIndex] && createPortal(
         <div
           onClick={() => setPreviewIndex(null)}
           style={{
             position: "fixed",
             inset: 0,
             zIndex: 99999,
-            background: "rgba(0,0,0,0.15)",
-            backdropFilter: "blur(12px)",
-            WebkitBackdropFilter: "blur(6px)",
+            background: "rgba(0,0,0,0.55)",
+            backdropFilter: "blur(4px)",
+            WebkitBackdropFilter: "blur(4px)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -376,7 +453,8 @@ export default function ChatInput({ value, onChange, onSend, isRunning, onStop, 
               <X size={16} strokeWidth={2} />
             </button>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

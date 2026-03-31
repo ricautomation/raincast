@@ -13,6 +13,10 @@ const AI_PROVIDERS: Array<{ id: string; name: string; providerId?: AiProviderId 
   { id: "openai",    name: "OpenAI" },
 ];
 
+const SEARCH_PROVIDERS: Array<{ id: string; name: string; hint: string }> = [
+  { id: "brave", name: "Brave Search", hint: "Free: 2000 queries/month" },
+];
+
 const TAB_MAX_W = 180;
 const TAB_MIN_W = 120;
 
@@ -23,8 +27,18 @@ function ApiKeyModal({ onClose }: { onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const [keys, setKeys] = useState<Record<string, string>>(() => {
     try {
-      return JSON.parse(localStorage.getItem("raincast-api-keys") || "{}");
-    } catch { return {}; }
+      const raw = localStorage.getItem("raincast-api-keys");
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        console.warn("[ApiKeyModal] Corrupted API keys in localStorage — resetting");
+        return {};
+      }
+      return parsed;
+    } catch {
+      console.warn("[ApiKeyModal] Failed to parse API keys from localStorage — resetting");
+      return {};
+    }
   });
   const [visibleId, setVisibleId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -255,6 +269,165 @@ function ApiKeyModal({ onClose }: { onClose: () => void }) {
             </div>
           );
         })}
+      </div>
+
+      {/* ── Search section ── */}
+      <div style={{
+        marginTop: 10,
+        paddingTop: 10,
+        borderTop: "1px solid var(--popover-border)",
+      }}>
+        <p style={{
+          fontSize: 11,
+          fontWeight: 600,
+          color: "var(--text-secondary)",
+          marginBottom: 8,
+          paddingLeft: 6,
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+        }}>
+          Search
+        </p>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {SEARCH_PROVIDERS.map((p) => {
+            const isOpen = expandedId === p.id;
+            const hasKey = !!keys[p.id];
+
+            return (
+              <div key={p.id}>
+                <button
+                  type="button"
+                  onClick={() => setExpandedId(isOpen ? null : p.id)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    width: "100%",
+                    padding: "8px 8px",
+                    borderRadius: 10,
+                    border: "none",
+                    background: isOpen ? "var(--subtle-bg)" : "transparent",
+                    cursor: "pointer",
+                    transition: "background 150ms ease, opacity 150ms ease",
+                    opacity: hasKey ? 1 : 0.7,
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.opacity = "1"; if (!isOpen) e.currentTarget.style.background = "var(--subtle-bg)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.opacity = hasKey ? "1" : "0.7"; if (!isOpen) e.currentTarget.style.background = "transparent"; }}
+                >
+                  <div style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: "50%",
+                    background: hasKey ? "#34c759" : "var(--text-tertiary)",
+                    flexShrink: 0,
+                    transition: "background 200ms ease",
+                  }} />
+
+                  <span style={{
+                    fontSize: 13,
+                    fontWeight: hasKey ? 600 : 500,
+                    color: hasKey ? "var(--text-primary)" : "var(--text-secondary)",
+                    flex: 1,
+                    textAlign: "left",
+                    transition: "color 200ms ease",
+                  }}>
+                    {p.name}
+                  </span>
+
+                  {!hasKey && !isOpen && (
+                    <span style={{
+                      fontSize: 10,
+                      fontWeight: 600,
+                      color: "var(--text-secondary)",
+                      marginRight: 2,
+                    }}>
+                      Not set
+                    </span>
+                  )}
+
+                  <ChevronRight
+                    size={12}
+                    strokeWidth={2}
+                    style={{
+                      color: "var(--text-tertiary)",
+                      transition: "transform 200ms ease",
+                      transform: isOpen ? "rotate(90deg)" : "rotate(0deg)",
+                      flexShrink: 0,
+                    }}
+                  />
+                </button>
+
+                {isOpen && (
+                  <div style={{ padding: "6px 8px 10px 23px" }}>
+                    <label style={{
+                      fontSize: 10,
+                      fontWeight: 600,
+                      color: "var(--text-tertiary)",
+                      marginBottom: 4,
+                      display: "block",
+                      letterSpacing: "0.03em",
+                      textTransform: "uppercase",
+                    }}>
+                      API Key
+                    </label>
+                    <div style={{ position: "relative" }}>
+                      <input
+                        type={visibleId === p.id ? "text" : "password"}
+                        value={keys[p.id] || ""}
+                        onChange={(e) => updateKey(p.id, e.target.value)}
+                        placeholder={`Enter ${p.name} API key...`}
+                        style={{
+                          width: "100%",
+                          padding: "6px 30px 6px 10px",
+                          fontSize: 12,
+                          borderRadius: 8,
+                          border: "1px solid var(--input-border)",
+                          background: "var(--input-bg)",
+                          color: "var(--text-input)",
+                          outline: "none",
+                          boxSizing: "border-box",
+                        }}
+                        onFocus={(e) => { e.currentTarget.style.borderColor = "var(--slider-thumb)"; }}
+                        onBlur={(e) => { e.currentTarget.style.borderColor = "var(--input-border)"; }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setVisibleId(visibleId === p.id ? null : p.id)}
+                        style={{
+                          position: "absolute",
+                          right: 6,
+                          top: "50%",
+                          transform: "translateY(-50%)",
+                          background: "none",
+                          border: "none",
+                          cursor: "pointer",
+                          color: "var(--text-tertiary)",
+                          display: "flex",
+                          alignItems: "center",
+                          padding: 2,
+                        }}
+                      >
+                        {visibleId === p.id
+                          ? <EyeOff size={13} strokeWidth={1.8} />
+                          : <Eye size={13} strokeWidth={1.8} />
+                        }
+                      </button>
+                    </div>
+                    <p style={{
+                      marginTop: 6,
+                      fontSize: 10,
+                      color: "var(--text-tertiary)",
+                      lineHeight: 1.4,
+                    }}>
+                      {p.hint}
+                    </p>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

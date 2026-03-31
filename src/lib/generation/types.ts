@@ -31,6 +31,8 @@ export interface GenerationStatus {
   rolledBack?: boolean;
   fixAttempt?: number;
   fixMaxAttempts?: number;
+  /** Set to true when the Rust backend agent has successfully compiled. */
+  backendReady?: boolean;
 }
 
 export const INITIAL_STATUS: GenerationStatus = { phase: "idle" };

@@ -11,6 +11,14 @@ function getKeys(): Record<string, string> {
   }
 }
 
+function setKeys(keys: Record<string, string>): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
+  } catch {
+    console.warn("[settings] Failed to save API keys to localStorage");
+  }
+}
+
 export function getGeminiApiKey(): string | null {
   return getKeys().google || null;
 }
@@ -18,7 +26,7 @@ export function getGeminiApiKey(): string | null {
 export function setGeminiApiKey(key: string): void {
   const keys = getKeys();
   keys.google = key;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
+  setKeys(keys);
 }
 
 export function getAnthropicApiKey(): string | null {
@@ -28,19 +36,37 @@ export function getAnthropicApiKey(): string | null {
 export function setAnthropicApiKey(key: string): void {
   const keys = getKeys();
   keys.anthropic = key;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
+  setKeys(keys);
+}
+
+export function getBraveApiKey(): string | null {
+  return getKeys().brave || null;
+}
+
+export function setBraveApiKey(key: string): void {
+  const keys = getKeys();
+  keys.brave = key;
+  setKeys(keys);
 }
 
 export function getActiveProviderId(): AiProviderId {
-  const stored = localStorage.getItem(PROVIDER_KEY);
-  if (stored === "gemini" || stored === "anthropic") return stored;
+  try {
+    const stored = localStorage.getItem(PROVIDER_KEY);
+    if (stored === "gemini" || stored === "anthropic") return stored;
+  } catch { /* localStorage unavailable */ }
   return "gemini"; // default
 }
 
 export function setActiveProviderId(id: AiProviderId): void {
-  localStorage.setItem(PROVIDER_KEY, id);
+  try {
+    localStorage.setItem(PROVIDER_KEY, id);
+  } catch {
+    console.warn("[settings] Failed to save active provider to localStorage");
+  }
   // Also persist to DB (fire-and-forget)
   import("../tauri/db").then(({ dbSetSetting }) => {
-    dbSetSetting("active_provider", id).catch(() => {});
+    dbSetSetting("active_provider", id).catch((err) => {
+      console.error("[settings] Failed to persist provider to DB:", err);
+    });
   });
 }

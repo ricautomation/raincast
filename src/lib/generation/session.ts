@@ -2,10 +2,11 @@ import type { GenerationStatus } from "./types";
 import type { GenerationManifest, ManifestCheckpoint } from "./manifest";
 import { createManifest } from "./manifest";
 import type { AiProvider, GenerationPlan, Diagnostic, InvestigationPlan, InvestigationContext, BackendCommand } from "../ai/types";
-import { formatMessages, extractImages, buildReviewPlan, buildGenerateRustBackend, parseJson } from "../ai/prompts";
+import { formatMessages, extractImages, buildReviewPlan, buildGenerateRustBackend, buildFixProxyErrors, parseJson } from "../ai/prompts";
 import { replaceBlock, NotFound, AmbiguousMatch } from "@rain/editkit/core";
 import type { ChatMessage } from "../chat/types";
-import { initProject, stageFiles, applyCheckpoint, runValidation, rollbackSnapshot, readProjectFile, readProjectSourceFiles, listDir, grepProjectFiles, getSystemInfo } from "../tauri/workspace";
+import { initProject, stageFiles, applyCheckpoint, runValidation, rollbackSnapshot, readProjectFile, readProjectSourceFiles, listDir, grepProjectFiles, getSystemInfo, buildProxyBinary, writeProjectFile } from "../tauri/workspace";
+import { extractProxySource } from "./proxyExtract";
 import type { DirEntry } from "../tauri/workspace";
 import { type ScaffoldTier, type LayoutArchetype, getScaffold } from "./scaffolds";
 import { runAgentLoop, runRustAgentLoop } from "../ai/agentLoop";
@@ -45,15 +46,19 @@ export interface SessionConfig {
   onFirstCheckpointApplied?: () => void;
   /** Ephemeral tool status during agent loop. null = clear. */
   onToolStatus?: (status: { text: string; tool?: string; args?: string } | null) => void;
+  /** Called after a tool finishes with the result content — for UI animation. */
+  onToolResult?: (toolName: string, result: string) => void;
   /** Called when the agent renames the project via rename_project tool. */
   onProjectRenamed?: (newName: string) => void;
   /** Returns current runtime console errors from the preview iframe (if any). */
   getRuntimeErrors?: () => string[];
+  /** Separate log stream for Rust agent loop — shown in its own drawer. */
+  onRustLog?: (line: string) => void;
 }
 
 /** Shared status signal between frontend and Rust backend generation. */
 interface BackendSignal {
-  phase: "idle" | "generating" | "compiling" | "verifying" | "done" | "failed";
+  phase: "idle" | "generating" | "compiling" | "verifying" | "building_proxy" | "done" | "failed";
   turn: number;
   maxTurns: number;
   lastStatus: string;
@@ -76,8 +81,51 @@ export class GenerationSession {
     phase: "idle", turn: 0, maxTurns: 0, lastStatus: "", success: false,
   };
 
+  /** Queue for file scroll animations — drains at animation pace while generation continues. */
+  private scrollQueue: Array<{ toolName: string; statusText: string; args?: string; content: string }> = [];
+  private scrollDraining = false;
+
   constructor(config: SessionConfig) {
     this.config = config;
+  }
+
+  /** Enqueue a file for scroll animation. Drains in background at animation pace. */
+  private enqueueScroll(item: { toolName: string; statusText: string; args?: string; content: string }): void {
+    this.scrollQueue.push(item);
+    if (!this.scrollDraining) this.drainScrollQueue();
+  }
+
+  /** Drain the scroll queue — one file at a time, waiting for animation to roughly finish. */
+  private async drainScrollQueue(): Promise<void> {
+    if (this.scrollDraining) return;
+    this.scrollDraining = true;
+
+    try {
+      while (this.scrollQueue.length > 0) {
+        if (this.aborted) break;
+        const item = this.scrollQueue.shift()!;
+
+        // Emit tool status + result to trigger scroll animation
+        this.config.onToolStatus?.({ text: item.statusText, tool: item.toolName, args: item.args });
+        this.config.onToolResult?.(item.toolName, item.content.slice(0, 2000));
+
+        // Wait for animation: ~line_count * speed, capped at 4s
+        const lineCount = item.content.split("\n").filter((l) => l.trim()).length;
+        const speed = Math.max(100, Math.min(250, 5000 / Math.max(lineCount, 1)));
+        const animTime = Math.min(lineCount * speed, 4000);
+        // Wait at least 800ms so the user sees something, plus the animation time
+        await new Promise((r) => setTimeout(r, Math.max(800, animTime)));
+      }
+    } finally {
+      this.scrollDraining = false;
+    }
+  }
+
+  /** Wait for scroll queue to fully drain (call before clearing tool status). */
+  private async flushScrollQueue(): Promise<void> {
+    while (this.scrollDraining) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
   }
 
   cancel(): void {
@@ -107,14 +155,38 @@ export class GenerationSession {
       content: "",
     });
 
-    // Stream LLM-generated natural text into it
+    // Buffer + typewriter: collect AI chunks, then flush to UI at a steady pace
+    // so it looks like natural streaming even when the model responds fast.
+    const buffer: string[] = [];
+    let flushing = false;
+    const flushBuffer = async () => {
+      if (flushing) return;
+      flushing = true;
+      try {
+        while (buffer.length > 0) {
+          const chunk = buffer.shift()!;
+          this.config.onChatStatusAppend?.(msgId, chunk);
+          // ~30ms per chunk gives a smooth typewriter feel (~33 chunks/sec)
+          await new Promise((r) => setTimeout(r, 30));
+        }
+      } finally {
+        flushing = false;
+      }
+    };
+
+    // Stream LLM-generated natural text into the buffer
     try {
       await this.config.provider.streamBriefStatus({
         context,
         onChunk: (text) => {
-          this.config.onChatStatusAppend?.(msgId, text);
+          buffer.push(text);
+          if (!flushing) flushBuffer();
         },
       });
+      // Flush any remaining buffered chunks
+      if (buffer.length > 0 && !flushing) await flushBuffer();
+      // Wait for any in-progress flush
+      while (flushing) await new Promise((r) => setTimeout(r, 10));
     } catch {
       // Use the clean fallback, never dump raw prompt context into the UI
       this.config.onChatStatusAppend?.(msgId, opts?.fallback ?? context);
@@ -127,6 +199,7 @@ export class GenerationSession {
     const result = await runValidation(projectId, ["npm install"]);
     if (result.ok) {
       this.log(`[deps] npm install completed successfully`);
+      this.depsInstalled = true;
     } else {
       this.log(`[deps] npm install exited with code ${result.exit_code}`);
       if (result.stderr_tail.length > 0) {
@@ -134,8 +207,8 @@ export class GenerationSession {
           this.log(`  ${line}`);
         }
       }
+      // Don't set depsInstalled — allow retry on next call
     }
-    this.depsInstalled = true;
   }
 
   private logFileContent(path: string, content: string): void {
@@ -250,11 +323,15 @@ export class GenerationSession {
 
         let lastAgentStatus = "";
         const agentImages = extractImages(messages);
+        const agentSysInfo = systemInfo
+          ? `OS: ${systemInfo.os} (${systemInfo.arch})\nHome: ${systemInfo.home_dir}\nDesktop: ${systemInfo.desktop_dir}\nDocuments: ${systemInfo.documents_dir}\nDownloads: ${systemInfo.downloads_dir}`
+          : undefined;
         const agentResult = await runAgentLoop({
           projectId,
           messages,
           manifest: manifestStr,
           images: agentImages.length > 0 ? agentImages : undefined,
+          systemInfo: agentSysInfo,
           generate: (system, user, images) => provider.rawGenerate({
             system,
             user,
@@ -269,6 +346,9 @@ export class GenerationSession {
           },
           onToolCall: (toolName, toolArgs) => {
             this.config.onToolStatus?.({ text: lastAgentStatus, tool: toolName, args: toolArgs });
+          },
+          onToolResult: (toolName, result) => {
+            this.config.onToolResult?.(toolName, result);
           },
           onRenameProject: (newName) => {
             this.config.onProjectRenamed?.(newName);
@@ -512,7 +592,7 @@ export class GenerationSession {
       });
       if (this.aborted) return;
 
-      const reviewResult = parseJson<{ checkpoints: typeof initialPlan.checkpoints; backendCommands?: BackendCommand[]; changes?: string }>(reviewRaw);
+      const reviewResult = parseJson<{ checkpoints: typeof initialPlan.checkpoints; backendCommands?: BackendCommand[]; changes?: string; window?: { width: number; height: number } }>(reviewRaw);
       const buildPlan = reviewResult && reviewResult.checkpoints?.length > 0
         ? { checkpoints: reviewResult.checkpoints, backendCommands: reviewResult.backendCommands }
         : initialPlan;
@@ -521,6 +601,21 @@ export class GenerationSession {
       const backendCommands: BackendCommand[] = buildPlan.backendCommands
         ?? initialPlan.backendCommands
         ?? [];
+
+      // Persist window config so ship_worker can read it for tauri.conf.json
+      const windowConfig = reviewResult?.window ?? initialPlan.window;
+      if (windowConfig && windowConfig.width && windowConfig.height) {
+        try {
+          await writeProjectFile(
+            this.config.projectId,
+            ".rain/window.json",
+            JSON.stringify(windowConfig),
+          );
+          this.log(`  Window config: ${windowConfig.width}×${windowConfig.height}`);
+        } catch (e) {
+          this.log(`  Warning: could not save window config: ${e}`);
+        }
+      }
 
       const reviewChanges = reviewResult?.changes ?? "No changes";
       this.log(`  Plan review done (${elapsed(t0)}): ${reviewChanges}`);
@@ -658,9 +753,15 @@ export class GenerationSession {
         this.log(genResult.rawResponse);
         this.log("");
 
-        // Log full file contents
+        // Log full file contents + enqueue scroll animations per file
         for (const f of genResult.files) {
           this.logFileContent(f.path, f.content);
+          this.enqueueScroll({
+            toolName: "write_file",
+            statusText: `Writing ${f.path}...`,
+            args: JSON.stringify({ path: f.path }).slice(0, 200),
+            content: f.content,
+          });
         }
 
         // Track for next checkpoint's context
@@ -684,6 +785,9 @@ export class GenerationSession {
         filesDone += genResult.files.length;
         await flush();
       }
+
+      // Wait for any remaining scroll animations to finish before staging
+      await this.flushScrollQueue();
 
       // Now execute all checkpoints (stage, apply, validate, self-heal)
       this.config.onToolStatus?.({ text: "Applying files and running checks..." });
@@ -711,73 +815,32 @@ export class GenerationSession {
         if (this.backendSignal.phase === "done" || this.backendSignal.phase === "failed") {
           this.log(`  Rust backend already finished (${this.backendSignal.phase}).`);
         } else {
-          // Show live progress while waiting — activity-based timeout:
-          //   - Absolute max: 5 minutes
-          //   - Stall timeout: 90s with no turn advance → give up
+          // Wait indefinitely — the agent has its own turn limit (MAX_RUST_TURNS).
+          // Just show live progress while waiting.
           this.log("  Waiting for Rust backend...");
-          const ABSOLUTE_TIMEOUT = 300_000; // 5 min absolute max
-          const STALL_TIMEOUT = 90_000;     // 90s no progress → stalled
-          const waitStart = Date.now();
-          let lastSeenTurn = this.backendSignal.turn;
-          let lastTurnChangeAt = Date.now();
 
           const progressInterval = setInterval(() => {
             const sig = this.backendSignal;
-            // Track turn advancement for stall detection
-            if (sig.turn !== lastSeenTurn) {
-              lastSeenTurn = sig.turn;
-              lastTurnChangeAt = Date.now();
-            }
             const phaseLabel = sig.phase === "compiling" ? "Compiling Rust"
               : sig.phase === "verifying" ? "Verifying commands"
+              : sig.phase === "building_proxy" ? "Building dev-proxy binary"
               : `Rust agent turn ${sig.turn}/${sig.maxTurns}`;
             this.config.onToolStatus?.({ text: `${phaseLabel}` });
           }, 500);
 
-          // Wait for completion, stall, or absolute timeout
-          const waitResult = await new Promise<"done" | "stalled" | "timeout">((resolve) => {
-            const check = () => {
-              if (this.backendSignal.phase === "done" || this.backendSignal.phase === "failed") {
-                resolve("done");
-              } else if (Date.now() - lastTurnChangeAt > STALL_TIMEOUT) {
-                resolve("stalled");
-              } else if (Date.now() - waitStart > ABSOLUTE_TIMEOUT) {
-                resolve("timeout");
-              } else {
-                setTimeout(check, 300);
-              }
-            };
-            check();
-          });
-
-          clearInterval(progressInterval);
-
-          if (waitResult !== "done") {
-            const reason = waitResult === "stalled"
-              ? `no progress for ${Math.round(STALL_TIMEOUT / 1000)}s (stuck on turn ${this.backendSignal.turn})`
-              : `exceeded ${Math.round(ABSOLUTE_TIMEOUT / 1000)}s absolute limit`;
-            this.log(`  ⚠ Rust backend wait ended: ${reason}. Continuing — agent is still running in background.`);
-
-            // Keep a background listener so the result is logged when it eventually finishes
-            rustBackendPromise.then((success) => {
-              if (success) {
-                this.log("  ✓ Rust backend finished compiling (after frontend moved on) — commands are ready.");
-              } else {
-                this.log("  ✗ Rust backend failed (after frontend moved on) — OS commands will not work.");
-              }
-            }).catch(() => {
-              // already handled in the .catch wrapper above
-            });
+          // Await the promise — it will resolve when the agent finishes or hits max turns
+          try {
+            await rustBackendPromise;
+          } finally {
+            clearInterval(progressInterval);
           }
         }
 
         this.config.onToolStatus?.(null);
         if (this.backendSignal.success) {
           this.log("  ✓ Rust backend compiled successfully — commands are ready.");
-        } else if (this.backendSignal.phase === "done" || this.backendSignal.phase === "failed") {
-          this.log(`  ✗ Rust backend did not compile — OS commands will use try/catch fallbacks at runtime.${this.backendSignal.error ? ` (${this.backendSignal.error})` : ""}`);
         } else {
-          this.log("  ⏳ Rust backend still running in background — result will appear in log when it finishes.");
+          this.log(`  ✗ Rust backend did not compile — OS commands will use try/catch fallbacks at runtime.${this.backendSignal.error ? ` (${this.backendSignal.error})` : ""}`);
         }
       }
 
@@ -847,6 +910,15 @@ export class GenerationSession {
         });
         return false;
       }
+
+      // Filter out tauri.conf.json — it's managed by the build system, not the LLM
+      cp.files = cp.files.filter((f) => {
+        if (f.path === "src-tauri/tauri.conf.json" || f.path.endsWith("/tauri.conf.json")) {
+          this.log(`  ⚠ Skipped ${f.path} (managed by build system)`);
+          return false;
+        }
+        return true;
+      });
 
       // Stage
       this.log("");
@@ -1054,8 +1126,8 @@ export class GenerationSession {
         this.log(`[fix] No structured diagnostics — falling back to broad fix`);
         const broadResult = await this.broadFixFallback(provider, projectId, failedLabel, currentStdout, currentStderr, changedFiles);
         if (!broadResult) {
-          if (attempt === MAX_FIX_ITERS) break;
-          continue;
+          this.log(`[fix] Broad fix returned no patches — cannot make progress, stopping`);
+          break;
         }
         // broadResult has patches — proceed to apply below
         // (but we need the fix pipeline, so let's use the investigation pipeline with empty investigation)
@@ -1066,11 +1138,17 @@ export class GenerationSession {
       const errorFiles = new Set(diagnostics.map(d => d.file));
       for (const filePath of errorFiles) {
         try {
-          investigationContext.fileContents[filePath] = await readProjectFile(projectId, filePath);
+          const content = await readProjectFile(projectId, filePath);
+          investigationContext.fileContents[filePath] = content;
+          // Scroll animation: show erroring file being read
+          this.config.onToolStatus?.({ text: `Reading ${filePath}...`, tool: "read_file", args: JSON.stringify({ path: filePath }).slice(0, 200) });
+          this.config.onToolResult?.("read_file", content.slice(0, 2000));
+          await new Promise((r) => setTimeout(r, 400));
         } catch {
           this.log(`[fix] Could not read erroring file ${filePath}`);
         }
       }
+      this.config.onToolStatus?.(null);
       this.log(`[fix] Auto-read ${Object.keys(investigationContext.fileContents).length} erroring file(s): ${[...errorFiles].join(", ")}`);
 
       // ── Phase 1: INVESTIGATE — AI requests additional context (type defs, related files) ──
@@ -1104,6 +1182,7 @@ export class GenerationSession {
           const ctxLines = Object.keys(investigationContext.lineExtracts).length;
           const ctxSearches = Object.keys(investigationContext.searchResults).length;
           this.log(`[fix] Total context: ${ctxFiles} file(s), ${ctxLines} line extract(s), ${ctxSearches} search(es)`);
+          this.config.onToolStatus?.(null);
         }
       }
 
@@ -1187,6 +1266,10 @@ export class GenerationSession {
         try {
           const result = replaceBlock(currentContent, patch.old, patch.new);
           this.log(`  ✓ ${patch.path} (strategy: ${result.strategy})`);
+          // Scroll animation: show the edit being applied
+          this.config.onToolStatus?.({ text: `Patching ${patch.path}...`, tool: "edit_file", args: JSON.stringify({ path: patch.path, search: patch.old, replace: patch.new }).slice(0, 200) });
+          this.config.onToolResult?.("edit_file", `OK: Edited ${patch.path} (strategy: ${result.strategy})`);
+          await new Promise((r) => setTimeout(r, 400));
           if (alreadyPatched) {
             alreadyPatched.content = result.updated;
           } else {
@@ -1204,6 +1287,8 @@ export class GenerationSession {
           break;
         }
       }
+
+      this.config.onToolStatus?.(null);
 
       if (patchFailed || fixedFiles.length === 0) {
         this.log(`[fix] Patch application failed — continuing to next attempt`);
@@ -1332,8 +1417,13 @@ export class GenerationSession {
     for (const req of plan.requests) {
       if (req.readFile) {
         try {
-          result.fileContents[req.readFile] = await readProjectFile(projectId, req.readFile);
+          const content = await readProjectFile(projectId, req.readFile);
+          result.fileContents[req.readFile] = content;
           this.log(`  [investigate] Read ${req.readFile}`);
+          // Scroll animation: show file being read
+          this.config.onToolStatus?.({ text: `Reading ${req.readFile}...`, tool: "read_file", args: JSON.stringify({ path: req.readFile }).slice(0, 200) });
+          this.config.onToolResult?.("read_file", content.slice(0, 2000));
+          await new Promise((r) => setTimeout(r, 400));
         } catch {
           this.log(`  [investigate] Could not read ${req.readFile}`);
         }
@@ -1346,10 +1436,15 @@ export class GenerationSession {
           const start = Math.max(0, req.readLines.startLine - 1);
           const end = Math.min(lines.length, req.readLines.endLine);
           const key = `${req.readLines.file}:${req.readLines.startLine}-${req.readLines.endLine}`;
-          result.lineExtracts[key] = lines.slice(start, end)
+          const extract = lines.slice(start, end)
             .map((l, i) => `${start + i + 1}: ${l}`)
             .join("\n");
+          result.lineExtracts[key] = extract;
           this.log(`  [investigate] Lines ${req.readLines.startLine}-${req.readLines.endLine} of ${req.readLines.file}`);
+          // Scroll animation: show line extract
+          this.config.onToolStatus?.({ text: `Reading ${req.readLines.file}:${req.readLines.startLine}-${req.readLines.endLine}...`, tool: "read_file", args: JSON.stringify({ path: req.readLines.file }).slice(0, 200) });
+          this.config.onToolResult?.("read_file", extract.slice(0, 2000));
+          await new Promise((r) => setTimeout(r, 400));
         } catch {
           this.log(`  [investigate] Could not read lines from ${req.readLines.file}`);
         }
@@ -1360,6 +1455,11 @@ export class GenerationSession {
           const matches = await grepProjectFiles(projectId, req.searchPattern.pattern, req.searchPattern.fileGlob, 20);
           result.searchResults[req.searchPattern.pattern] = matches;
           this.log(`  [investigate] Grep "${req.searchPattern.pattern}" → ${matches.length} match(es)`);
+          // Scroll animation: show grep results
+          const grepResult = matches.map((m) => `${m.file}:${m.line}: ${m.text}`).join("\n");
+          this.config.onToolStatus?.({ text: `Searching "${req.searchPattern.pattern}"...`, tool: "grep", args: JSON.stringify({ pattern: req.searchPattern.pattern }).slice(0, 200) });
+          this.config.onToolResult?.("grep", grepResult.slice(0, 2000));
+          await new Promise((r) => setTimeout(r, 400));
         } catch {
           this.log(`  [investigate] Grep failed for "${req.searchPattern.pattern}"`);
         }
@@ -1498,22 +1598,32 @@ export class GenerationSession {
     }
 
     // Build the correct Tauri 2 lib.rs + main.rs pattern
-    // If AI returned libRs, use it. Otherwise construct from mainRs or default.
-    const libRs = genResult.libRs || (genResult.mainRs?.includes("pub fn run()") ? genResult.mainRs : `mod commands;\n\npub fn run() {\n    tauri::Builder::default()\n        .invoke_handler(tauri::generate_handler![\n            ${commands.map(c => `commands::${c.name}`).join(",\n            ")},\n        ])\n        .run(tauri::generate_context!())\n        .expect("error while running tauri application");\n}\n`);
+    // ALWAYS force clean structure: lib.rs = mod commands + run(), commands.rs = implementations
+    // Even if the AI returned libRs with commands inline, we override it.
+    const libRsFromAi = genResult.libRs || "";
+    const libRsHasInlineCommands = libRsFromAi.includes("#[tauri::command]");
+    const libRs = libRsHasInlineCommands
+      // AI put commands in lib.rs — override with clean version
+      ? `mod commands;\n\npub fn run() {\n    tauri::Builder::default()\n        .invoke_handler(tauri::generate_handler![\n            ${commands.map(c => `commands::${c.name}`).join(",\n            ")},\n        ])\n        .run(tauri::generate_context!())\n        .expect("error while running tauri application");\n}\n`
+      // AI returned a clean lib.rs (or none) — use it or construct default
+      : (libRsFromAi && libRsFromAi.includes("pub fn run()"))
+        ? libRsFromAi
+        : `mod commands;\n\npub fn run() {\n    tauri::Builder::default()\n        .invoke_handler(tauri::generate_handler![\n            ${commands.map(c => `commands::${c.name}`).join(",\n            ")},\n        ])\n        .run(tauri::generate_context!())\n        .expect("error while running tauri application");\n}\n`;
     const mainRs = genResult.mainRs?.includes("generated_app_lib::run()")
       ? genResult.mainRs
       : `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]\n\nfn main() {\n    generated_app_lib::run();\n}\n`;
 
     const defaultCargoToml = `[package]\nname = "generated-app"\nversion = "1.0.0"\nedition = "2021"\n\n[lib]\nname = "generated_app_lib"\ncrate-type = ["staticlib", "cdylib", "rlib"]\n\n[build-dependencies]\ntauri-build = { version = "2", features = [] }\n\n[dependencies]\ntauri = { version = "2", features = [] }\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\n`;
 
-    this.log(`  Generated initial Rust code (${elapsed(t0)})`);
-    this.log("");
-    this.log("  ── commands.rs ──");
-    this.log(genResult.commandsRs);
-    this.log("  ── lib.rs ──");
-    this.log(libRs);
-    this.log("  ── main.rs ──");
-    this.log(mainRs);
+    const rustLog = (line: string) => { this.log(line); this.config.onRustLog?.(line); };
+    rustLog(`  Generated initial Rust code (${elapsed(t0)})`);
+    rustLog("");
+    rustLog("  ── commands.rs ──");
+    rustLog(genResult.commandsRs);
+    rustLog("  ── lib.rs ──");
+    rustLog(libRs);
+    rustLog("  ── main.rs ──");
+    rustLog(mainRs);
 
     // Step 2: Hand off to Rust agent loop for compilation + fixing
     const commandSpecs = commands.map((cmd) => {
@@ -1549,6 +1659,7 @@ export class GenerationSession {
       },
       onLog: (line) => {
         this.log(line);
+        this.config.onRustLog?.(line);
         // Track turn number from log output
         const turnMatch = line.match(/Rust Agent Turn (\d+)/);
         if (turnMatch) this.backendSignal.turn = parseInt(turnMatch[1], 10);
@@ -1556,22 +1667,149 @@ export class GenerationSession {
       isAborted: () => this.aborted,
     });
 
-    this.backendSignal = {
-      phase: result.success ? "done" : "failed",
-      turn: this.backendSignal.turn,
-      maxTurns: 50,
-      lastStatus: result.message,
-      success: result.success,
-      error: result.success ? undefined : result.message,
-    };
-
     this.log(`  Rust agent loop finished (${elapsed(t0)}) — ${result.success ? "SUCCESS" : "FAILED"}`);
+    this.config.onRustLog?.(`\n── Rust agent loop finished (${elapsed(t0)}) — ${result.success ? "SUCCESS" : "FAILED"} ──`);
 
     if (!result.success) {
+      this.backendSignal = {
+        phase: "failed",
+        turn: this.backendSignal.turn,
+        maxTurns: 50,
+        lastStatus: result.message,
+        success: false,
+        error: result.message,
+      };
       this.log("  WARNING: Rust backend did not compile — frontend will still work but OS commands will fail at runtime.");
+      this.config.onRustLog?.("  WARNING: Rust backend did not compile.");
+      return false;
     }
 
-    return result.success;
+    // Cargo check passed — but don't mark done yet if we need the proxy binary.
+    // Build the proxy binary for dev-mode command execution.
+    this.backendSignal = {
+      phase: "building_proxy",
+      turn: this.backendSignal.turn,
+      maxTurns: 50,
+      lastStatus: "Building dev-proxy binary...",
+      success: false, // not yet
+    };
+
+    this.log("  Building dev-proxy binary...");
+    this.config.onRustLog?.("  Building dev-proxy binary...");
+    let proxyBuildOk = false;
+    const MAX_PROXY_FIX_ATTEMPTS = 3;
+
+    try {
+      // Read the Rust source files
+      const sources: Record<string, string> = {};
+      for (const fileName of ["src-tauri/src/commands.rs", "src-tauri/src/lib.rs"]) {
+        try {
+          const content = await readProjectFile(this.config.projectId, fileName);
+          if (content && content.includes("#[tauri::command]")) {
+            sources[fileName] = content;
+          }
+        } catch { /* file may not exist */ }
+      }
+
+      const extracted = extractProxySource(sources);
+      if (extracted.commands.length > 0) {
+        this.log(`  Extracted ${extracted.commands.length} commands: ${extracted.commands.join(", ")}`);
+        this.config.onRustLog?.(`  Extracted commands: ${extracted.commands.join(", ")}`);
+
+        let currentMainRs = extracted.mainRs;
+        let currentCargoToml = extracted.cargoToml;
+
+        for (let attempt = 1; attempt <= MAX_PROXY_FIX_ATTEMPTS; attempt++) {
+          try {
+            const binaryPath = await buildProxyBinary(
+              this.config.projectId,
+              currentMainRs,
+              currentCargoToml,
+            );
+            this.log(`  Dev-proxy binary compiled: ${binaryPath}`);
+            this.config.onRustLog?.("  Dev-proxy binary compiled successfully.");
+            proxyBuildOk = true;
+            break;
+          } catch (buildErr) {
+            const errMsg = buildErr instanceof Error ? buildErr.message : String(buildErr);
+
+            if (attempt >= MAX_PROXY_FIX_ATTEMPTS) {
+              this.log(`  ✗ Proxy build FAILED after ${attempt} attempts: ${errMsg}`);
+              this.config.onRustLog?.(`  ✗ Proxy build FAILED after ${attempt} attempts.`);
+              break;
+            }
+
+            this.log(`  ✗ Proxy build attempt ${attempt} failed — asking AI to fix...`);
+            this.config.onRustLog?.(`  ✗ Proxy attempt ${attempt} failed — fixing errors...`);
+
+            const fixPrompt = buildFixProxyErrors({
+              mainRs: currentMainRs,
+              cargoToml: currentCargoToml,
+              errors: errMsg,
+            });
+
+            const provider = this.config.provider;
+            const fixRaw = await provider.rawGenerate({
+              system: fixPrompt.system,
+              user: fixPrompt.user,
+              json: true,
+              model: "pro",
+            });
+            if (this.aborted) return false;
+
+            const fixResult = parseJson<{
+              mainRs?: string | null;
+              cargoToml?: string | null;
+            }>(fixRaw);
+
+            if (!fixResult) {
+              this.log("  ✗ AI returned invalid JSON for proxy fix — giving up.");
+              this.config.onRustLog?.("  ✗ AI fix response was invalid — giving up.");
+              break;
+            }
+
+            if (fixResult.mainRs) currentMainRs = fixResult.mainRs;
+            if (fixResult.cargoToml) currentCargoToml = fixResult.cargoToml;
+
+            this.log(`  Retrying proxy build (attempt ${attempt + 1})...`);
+            this.config.onRustLog?.(`  Retrying proxy build (attempt ${attempt + 1})...`);
+          }
+        }
+      } else {
+        this.log("  No commands to extract — skipping proxy binary.");
+        proxyBuildOk = true; // No commands = nothing to build, still OK
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`  ✗ Dev-proxy binary build FAILED: ${msg}`);
+      this.config.onRustLog?.(`  ✗ Proxy build FAILED: ${msg}`);
+    }
+
+    // NOW mark done/failed based on proxy result
+    if (proxyBuildOk) {
+      this.backendSignal = {
+        phase: "done",
+        turn: this.backendSignal.turn,
+        maxTurns: 50,
+        lastStatus: "Backend ready",
+        success: true,
+      };
+      this.log("  Emitting backendReady=true");
+      this.config.onStatus({ phase: "generating", message: "Backend compiled", backendReady: true });
+    } else {
+      this.backendSignal = {
+        phase: "failed",
+        turn: this.backendSignal.turn,
+        maxTurns: 50,
+        lastStatus: "Proxy build failed",
+        success: false,
+        error: "Proxy binary failed to compile",
+      };
+      this.log("  ✗ Backend NOT marked ready — proxy binary must compile for dev mode to work.");
+      this.config.onRustLog?.("  ✗ Backend NOT ready — proxy binary failed to compile.");
+    }
+
+    return proxyBuildOk;
   }
 }
 

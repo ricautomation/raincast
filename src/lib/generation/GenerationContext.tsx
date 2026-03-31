@@ -14,11 +14,12 @@ interface GenerationCtx {
   redoStack: string[];
   hasProject: boolean;
   generationLogs: string[];
+  rustAgentLogs: string[];
   /** Active project ID (for convenience) */
   activeProjectId: string;
   /** Ref that PreviewPane populates with a function returning current runtime errors. */
   runtimeErrorsRef: React.MutableRefObject<(() => string[]) | null>;
-  start: (projectId: string, messages: ChatMessage[], mode: "build" | "edit", reason?: string, onFirstCheckpoint?: () => void, onChatStatus?: (msg: ChatMessage) => void, onChatStatusAppend?: (id: string, textChunk: string) => void, layoutArchetype?: LayoutArchetype, onToolStatus?: (status: { text: string; tool?: string; args?: string } | null) => void, onProjectRenamed?: (newName: string) => void, scaffoldTier?: ScaffoldTier) => void;
+  start: (projectId: string, messages: ChatMessage[], mode: "build" | "edit", reason?: string, onFirstCheckpoint?: () => void, onChatStatus?: (msg: ChatMessage) => void, onChatStatusAppend?: (id: string, textChunk: string) => void, layoutArchetype?: LayoutArchetype, onToolStatus?: (status: { text: string; tool?: string; args?: string } | null) => void, onProjectRenamed?: (newName: string) => void, onToolResult?: (toolName: string, result: string) => void, scaffoldTier?: ScaffoldTier) => void;
   cancel: (projectId: string) => void;
   undoLast: (projectId: string) => Promise<void>;
   redoNext: (projectId: string) => Promise<void>;
@@ -34,6 +35,7 @@ const GenerationContext = createContext<GenerationCtx>({
   redoStack: [],
   hasProject: false,
   generationLogs: [],
+  rustAgentLogs: [],
   activeProjectId: "",
   runtimeErrorsRef: _nullRef,
   start: () => {},
@@ -60,6 +62,7 @@ export function GenerationProvider({ children }: { children: ReactNode }) {
     redoStack: project.history.slice(project.cursor + 1),
     hasProject: project.hasProject,
     generationLogs: project.generationLogs,
+    rustAgentLogs: project.rustAgentLogs,
     activeProjectId: activeId,
     runtimeErrorsRef,
     start: gen.start,

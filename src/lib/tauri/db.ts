@@ -48,7 +48,7 @@ function toChatMessage(msg: DbMessage): ChatMessage {
     role: msg.role as ChatMessage["role"],
     content: msg.content,
     ...(msg.images.length > 0 ? { images: msg.images.map(toImageAttachment) } : {}),
-    ...(msg.status_data ? { statusData: JSON.parse(msg.status_data) } : {}),
+    ...(msg.status_data ? { statusData: (() => { try { return JSON.parse(msg.status_data); } catch { return undefined; } })() } : {}),
   };
 }
 

@@ -17,7 +17,8 @@ import { DESIGN_GUIDELINES } from "./prompts";
 import { replaceBlock } from "@rain/editkit/core";
 import { readProjectFile, grepProjectFiles, listDir, writeProjectFile, deleteProjectFile, runValidation } from "../tauri/workspace";
 import type { DirEntry } from "../tauri/workspace";
-import { webSearch, webFetch } from "@rain/webtools";
+import { webSearch, webFetch, webCrawl } from "@rain/webtools";
+import { getBraveApiKey } from "./settings";
 
 /** CORS-bypassing fetch via Tauri HTTP plugin. Lazy-loaded to avoid Vite resolution issues. */
 let _tauriFetch: typeof globalThis.fetch | null = null;
@@ -70,6 +71,8 @@ export interface AgentConfig {
   onStatus: (text: string) => void;
   /** Called before each tool is executed — tool name + serialized args */
   onToolCall?: (toolName: string, toolArgs: string) => void;
+  /** Called after a tool finishes — tool name + truncated result for UI animation */
+  onToolResult?: (toolName: string, result: string) => void;
   /** Called when the agent uses rename_project — updates the tab name + database */
   onRenameProject?: (newName: string) => void;
   onLog: (line: string) => void;
@@ -77,6 +80,8 @@ export interface AgentConfig {
   isAborted: () => boolean;
   /** Images from the user's chat messages — passed to the LLM on the first turn */
   images?: Array<{ mime: string; base64: string }>;
+  /** System info (OS, arch, dirs) for OS-scoped verification */
+  systemInfo?: string;
 }
 
 // ── Tool definitions ──
@@ -136,10 +141,20 @@ const TOOLS: AgentTool[] = [
   },
   {
     name: "web_fetch",
-    description: "Fetch a URL and extract its content as clean Markdown. Use this to read documentation pages, API references, tutorials, or any web page. Returns the page title, extracted content, and word count.",
+    description: "Fetch a single URL and extract its content as clean Markdown. Use this for pages where you know exactly what URL to read.",
     parameters: {
       url: { type: "string", description: "The URL to fetch", required: true },
       max_length: { type: "number", description: "Max content chars (default 15000)" },
+    },
+  },
+  {
+    name: "web_crawl",
+    description: "Crawl a documentation site starting from a URL. Fetches the page, finds relevant sub-links, and recursively follows them to gather comprehensive information. Use this instead of web_fetch when: (1) the starting page is an index/overview with links to detail pages, (2) you need information that might be spread across multiple pages, (3) you're exploring docs and don't know the exact URL. The crawler stays on the same domain and follows links scored by relevance to your query.",
+    parameters: {
+      url: { type: "string", description: "Starting URL — typically a docs landing page, API reference root, or getting-started page", required: true },
+      query: { type: "string", description: "What you're looking for — used to score which links to follow (e.g. 'authentication setup', 'WebSocket API', 'database connection')", required: true },
+      max_pages: { type: "number", description: "Max pages to fetch (default 6)" },
+      max_depth: { type: "number", description: "Max link depth from starting URL (default 2)" },
     },
   },
   {
@@ -191,6 +206,7 @@ Rules:
 - Write natural, friendly status messages — the user sees these. Don't say "calling read_file" — say what you're actually doing.
 - If a tool returns an error, adapt your approach. Don't retry the same failing call.
 - Stay focused on the user's request. Don't make changes beyond what was asked.
+- NEVER edit, create, or overwrite \`src-tauri/tauri.conf.json\`. This file is managed by the build system. The frontendDist, productName, identifier, and all Tauri config are set automatically — do not touch them.
 
 ## Common Action Patterns
 
@@ -258,12 +274,7 @@ async function executeTool(
       const path = args.path as string;
       if (!path) return "Error: 'path' is required";
       try {
-        // Check if we already have modified content in memory
-        if (fileState.has(path)) {
-          const content = fileState.get(path)!;
-          log(`  [read_file] ${path} (from memory, ${content.split("\n").length} lines)`);
-          return content;
-        }
+        // Always read from disk to avoid stale content
         const content = await readProjectFile(projectId, path);
         fileState.set(path, content);
         log(`  [read_file] ${path} (${content.split("\n").length} lines)`);
@@ -287,6 +298,12 @@ async function executeTool(
       const replace = args.replace as string;
       if (!path || search === undefined || replace === undefined) {
         return "Error: 'path', 'search', and 'replace' are all required";
+      }
+
+      // Block edits to tauri.conf.json — it's managed by the scaffold system
+      if (path === "src-tauri/tauri.conf.json" || path.endsWith("/tauri.conf.json")) {
+        log(`  [edit_file] ${path} — BLOCKED (protected config)`);
+        return "Error: src-tauri/tauri.conf.json is managed by the build system and cannot be edited. The frontendDist, productName, and other Tauri config values are set automatically.";
       }
 
       // Get current content — must have been read first
@@ -318,6 +335,11 @@ async function executeTool(
       const content = args.content as string;
       if (!path || content === undefined) {
         return "Error: 'path' and 'content' are required";
+      }
+      // Block creates targeting tauri.conf.json — it's managed by the build system
+      if (path === "src-tauri/tauri.conf.json" || path.endsWith("/tauri.conf.json")) {
+        log(`  [create_file] ${path} — BLOCKED (protected config)`);
+        return "Error: src-tauri/tauri.conf.json is managed by the build system and cannot be created or overwritten.";
       }
       fileState.set(path, content);
       log(`  [create_file] ${path} (${content.split("\n").length} lines)`);
@@ -376,7 +398,8 @@ async function executeTool(
       const maxResults = (args.max_results as number) || 5;
       try {
         const fetchFn = await getTauriFetch();
-        const results = await webSearch(query, { maxResults, timeoutMs: 8000, fetchFn });
+        const braveApiKey = getBraveApiKey() || undefined;
+        const results = await webSearch(query, { maxResults, timeoutMs: 8000, fetchFn, braveApiKey });
         if (results.length === 0) {
           log(`  [web_search] "${query}" — no results`);
           return "No results found.";
@@ -401,6 +424,35 @@ async function executeTool(
       } catch (err) {
         log(`  [web_fetch] ${url} — FAILED: ${err}`);
         return `Error: Fetch failed — ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
+    case "web_crawl": {
+      const url = args.url as string;
+      const query = args.query as string;
+      if (!url) return "Error: 'url' is required";
+      if (!query) return "Error: 'query' is required";
+      const maxPages = (args.max_pages as number) || 6;
+      const maxDepth = (args.max_depth as number) || 2;
+      try {
+        const fetchFn = await getTauriFetch();
+        const result = await webCrawl(url, {
+          query,
+          maxPages,
+          maxDepth,
+          maxContentLength: 15000,
+          timeoutMs: 10000,
+          fetchFn,
+          onPage: (pageUrl, wordCount, depth) => {
+            log(`  [web_crawl] depth=${depth} ${pageUrl} — ${wordCount} words`);
+          },
+        });
+        log(`  [web_crawl] Done: ${result.pages.length} pages, ${result.totalWords} words, ${result.elapsedMs}ms`);
+        const summary = result.pages.map((p) => `- ${p.title || p.url} (${p.wordCount} words)`).join("\n");
+        return `# Crawl results for: ${query}\n\nStarting URL: ${url}\nPages fetched: ${result.pages.length}\nTotal words: ${result.totalWords}\n\n## Pages found:\n${summary}\n\n---\n\n${result.content}`;
+      } catch (err) {
+        log(`  [web_crawl] ${url} — FAILED: ${err}`);
+        return `Error: Crawl failed — ${err instanceof Error ? err.message : String(err)}`;
       }
     }
 
@@ -500,6 +552,7 @@ async function runVerify(
   generate: (system: string, user: string) => Promise<string>,
   conversation: string,
   log: (line: string) => void,
+  systemInfo?: string,
 ): Promise<string> {
   // 1. Write all modified files to disk
   const modifiedPaths: string[] = [];
@@ -575,9 +628,13 @@ async function runVerify(
     .join("\n\n");
 
   try {
+    const osBlock = systemInfo
+      ? `\nTARGET PLATFORM: ${systemInfo}\nThis app is built for this specific platform ONLY. Do NOT flag cross-platform compatibility issues. Platform-specific APIs and patterns are acceptable when they match the target.\n`
+      : "";
+
     const reviewResponse = await generate(
       `You are a code reviewer verifying that changes correctly address the user's request. You are NOT checking for compilation errors (those already passed). You are checking for LOGICAL and BEHAVIORAL correctness.
-
+${osBlock}
 Check these things:
 1. Does the code ACTUALLY do what the user asked? Not just look like it — does the logic work?
 2. Are there placeholder/stub implementations that compile but don't do anything real? (e.g., empty function bodies, hardcoded returns, TODO comments, console.log instead of real logic)
@@ -593,20 +650,22 @@ Return JSON:
 }
 
 If everything looks correct and complete, return { "pass": true, "issues": [] }.
-Be strict but fair — only flag real problems, not style preferences.`,
+Be strict but fair — only flag real problems, not style preferences. Do NOT flag cross-platform concerns or hypothetical edge cases.`,
       `USER REQUEST:\n${conversation}\n\nCHANGED FILES:\n${changedFilesBlock}`,
     );
 
     // Parse review result
     const jsonMatch = reviewResponse.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      const review = JSON.parse(jsonMatch[0]) as { pass: boolean; issues: string[] };
-      if (review.pass) {
+      const review = JSON.parse(jsonMatch[0]);
+      const pass = typeof review?.pass === "boolean" ? review.pass : false;
+      const issues = Array.isArray(review?.issues) ? review.issues.filter((s: unknown) => typeof s === "string") : [];
+      if (pass) {
         log(`  [verify] Semantic review — PASSED`);
         return "OK: Compilation passed and code review confirms your changes correctly address the user's request.";
       }
-      const issueList = review.issues.map((s: string, i: number) => `${i + 1}. ${s}`).join("\n");
-      log(`  [verify] Semantic review — ${review.issues.length} issue(s)`);
+      const issueList = issues.map((s: string, i: number) => `${i + 1}. ${s}`).join("\n");
+      log(`  [verify] Semantic review — ${issues.length} issue(s)`);
       return `COMPILATION PASSED but code review found issues:\n${issueList}\n\nFix these issues, then call verify again.`;
     }
 
@@ -642,13 +701,25 @@ export async function runAgentLoop(config: AgentConfig): Promise<AgentResult> {
   // Cache for list_files — directory tree doesn't change during an agent run
   let listFilesCache: string | null = null;
 
-  // Build conversation context for the agent
-  const conversationLines: string[] = [];
-  for (const msg of messages) {
-    if (msg.role === "user") {
-      conversationLines.push(`User: ${msg.content}`);
-    } else if (msg.role === "assistant") {
-      conversationLines.push(`Assistant: ${msg.content}`);
+  // Build conversation context for the agent.
+  // Only the latest user message drives the task. We include a minimal prior
+  // exchange (the immediately preceding user+assistant pair) so the agent knows
+  // what was just discussed, but everything older is dropped — those issues are
+  // assumed resolved.
+  const latestUserMsg = [...messages].reverse().find((m) => m.role === "user");
+  const priorMessages = messages.slice(0, -1); // everything before the latest message
+
+  // Find the last user+assistant exchange just before the current message
+  const contextLines: string[] = [];
+  if (priorMessages.length > 0) {
+    // Walk backwards to find the previous user message and assistant reply
+    const lastPriorUser = [...priorMessages].reverse().find((m) => m.role === "user");
+    const lastPriorAssistant = [...priorMessages].reverse().find((m) => m.role === "assistant");
+    if (lastPriorUser || lastPriorAssistant) {
+      contextLines.push("── Previous exchange (context only — this is already handled) ──");
+      if (lastPriorUser) contextLines.push(`User: ${lastPriorUser.content}`);
+      if (lastPriorAssistant) contextLines.push(`Assistant: ${lastPriorAssistant.content}`);
+      contextLines.push("── End of previous exchange ──\n");
     }
   }
 
@@ -658,9 +729,14 @@ export async function runAgentLoop(config: AgentConfig): Promise<AgentResult> {
   // Initial user prompt
   agentHistory.push({
     role: "user",
-    content: `Here is the conversation with the user. Fulfill their latest request by reading and editing the source files.
+    content: `${contextLines.length > 0 ? contextLines.join("\n") + "\n" : ""}CURRENT REQUEST — act ONLY on this:
+User: ${latestUserMsg?.content ?? ""}
 
-${conversationLines.join("\n")}
+RULES:
+- ONLY fix or implement what the current request asks for.
+- Everything from previous messages is ALREADY RESOLVED — do not re-investigate, re-fix, or revisit old issues.
+- If the current request is vague (e.g. "fix it", "try again"), look at the previous exchange to understand what "it" refers to, but do NOT go further back.
+- Start by reading the relevant files to understand their CURRENT state, not what they used to be.
 
 ${config.images?.length ? `The user attached ${config.images.length} image(s) — you can see them alongside this message. Use the visual details to guide your edits (e.g. matching colors, layout, style from screenshots).\n\n` : ""}Begin by examining the manifest above to decide which files are relevant, then use tools to make the changes.`,
   });
@@ -699,7 +775,22 @@ ${config.images?.length ? `The user attached ${config.images.length} image(s) �
     const turnImages = turn === 0 ? config.images : undefined;
 
     const llmStart = performance.now();
-    const rawResponse = await generate(system, userContent, turnImages);
+    let rawResponse: string;
+    try {
+      rawResponse = await generate(system, userContent, turnImages);
+    } catch (llmErr) {
+      const msg = llmErr instanceof Error ? llmErr.message : String(llmErr);
+      onLog(`  [LLM] Error: ${msg}`);
+      // Retry once after a short delay for transient failures (e.g. "cannot parse response")
+      onLog(`  Retrying in 2s...`);
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        rawResponse = await generate(system, userContent, turnImages);
+      } catch (retryErr) {
+        onLog(`  [LLM] Retry also failed: ${retryErr instanceof Error ? retryErr.message : retryErr}`);
+        throw retryErr;
+      }
+    }
     const llmMs = Math.round(performance.now() - llmStart);
     onLog(`  [LLM] ${llmMs}ms`);
     onLog(`  Raw response: ${rawResponse.slice(0, 500)}...`);
@@ -766,7 +857,8 @@ ${config.images?.length ? `The user attached ${config.images.length} image(s) �
       // verify is handled here (not in executeTool) since it needs access to generate + conversation
       if (call.tool === "verify") {
         onLog(`  [verify] Starting compilation + semantic review...`);
-        const verifyResult = await runVerify(projectId, fileState, generate, conversationLines.join("\n"), onLog);
+        const fullConversation = messages.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`).join("\n");
+        const verifyResult = await runVerify(projectId, fileState, generate, fullConversation, onLog, config.systemInfo);
         const toolMs = Math.round(performance.now() - toolStart);
         onLog(`  [verify] ${toolMs}ms`);
         return `[verify] ${verifyResult}`;
@@ -796,6 +888,9 @@ ${config.images?.length ? `The user attached ${config.images.length} image(s) �
       if (call.tool === "list_files" && !result.startsWith("Error")) {
         listFilesCache = result;
       }
+
+      // Send result to UI for animation (truncated to keep it light)
+      config.onToolResult?.(call.tool, result.slice(0, 2000));
 
       const toolMs = Math.round(performance.now() - toolStart);
       onLog(`  [${call.tool}] ${toolMs}ms`);
@@ -945,7 +1040,13 @@ The user is building a desktop app. The frontend calls Rust commands via Tauri's
 1. All commands compile without errors
 2. Each command actually implements the described behavior (not stubs)
 3. Cargo.toml has the right dependencies
-4. main.rs correctly registers all commands with tauri::generate_handler![]
+4. lib.rs registers all commands with tauri::generate_handler![] (Tauri 2 uses lib.rs, NOT main.rs for the builder)
+
+## File Structure (CRITICAL — do not deviate)
+- src-tauri/src/commands.rs — ALL #[tauri::command] functions and helper structs. NO mod declarations, NO pub fn run(), NO tauri::Builder.
+- src-tauri/src/lib.rs — ONLY \`mod commands;\` and \`pub fn run()\` with the Builder. NO command implementations.
+- src-tauri/src/main.rs — ONLY \`fn main() { generated_app_lib::run(); }\`. Do NOT touch this file.
+- If commands are in lib.rs, MOVE them to commands.rs and add \`mod commands;\` to lib.rs.
 
 ## Required Commands
 ${commandSpecs}
@@ -991,6 +1092,7 @@ Rules:
 - ALWAYS use the \`src-tauri/\` prefix for all Rust file paths
 - Use cargo_check for quick compilation checks during iterative fixes
 - Use verify as the final gate — it checks both compilation AND correctness
+- NEVER edit, write, or overwrite \`src-tauri/tauri.conf.json\`. This file is managed by the build system. The frontendDist, productName, identifier, and all Tauri config are set automatically — do not touch it.
 - If the same error keeps recurring, try a different approach (rewrite the file instead of patching)
 - Keep Cargo.toml dependencies minimal — only add crates you actually use
 - All commands must use #[tauri::command] attribute
@@ -1001,21 +1103,26 @@ async function runRustVerify(
   projectId: string,
   fileState: Map<string, string>,
   commandSpecs: string,
-  conversation: string,
+  _conversation: string,
   generate: (system: string, user: string) => Promise<string>,
   log: (line: string) => void,
+  systemInfo?: string,
 ): Promise<string> {
   // 1. Flush all files to disk
+  const flushedFiles: string[] = [];
   for (const [path, content] of fileState) {
     await writeProjectFile(projectId, path, content);
+    flushedFiles.push(`${path} (${content.split("\n").length} lines)`);
   }
+  log(`  [verify] Flushed ${flushedFiles.length} files: ${flushedFiles.join(", ")}`);
 
   // 2. Cargo check
   try {
     const result = await runValidation(projectId, ["cargo check"]);
     if (!result.ok) {
       const errors = [...result.stdout_tail, ...result.stderr_tail].join("\n");
-      log("  [verify] Cargo check FAILED");
+      log("  [verify] Cargo check FAILED:");
+      log(errors);
       return `CARGO CHECK FAILED:\n${errors}\n\nFix the compilation errors first, then call verify again.`;
     }
     log("  [verify] Cargo check PASSED");
@@ -1024,44 +1131,57 @@ async function runRustVerify(
     return `Cargo check failed to run: ${err instanceof Error ? err.message : String(err)}`;
   }
 
-  // 3. Semantic review — does the code actually implement what's needed?
+  // 3. Semantic review — only review commands.rs (where implementations live)
   log("  [verify] Running semantic review...");
-  const commandsRs = fileState.get("src-tauri/src/commands.rs") || "";
-  const mainRs = fileState.get("src-tauri/src/main.rs") || "";
+  let commandsRs = "";
+  let sourceFile = "commands.rs";
+  try { commandsRs = await readProjectFile(projectId, "src-tauri/src/commands.rs"); } catch { commandsRs = fileState.get("src-tauri/src/commands.rs") || ""; }
+
+  // If commands.rs is empty, check lib.rs (agent may have put commands there)
+  if (!commandsRs.includes("#[tauri::command]")) {
+    sourceFile = "lib.rs";
+    try { commandsRs = await readProjectFile(projectId, "src-tauri/src/lib.rs"); } catch { commandsRs = fileState.get("src-tauri/src/lib.rs") || ""; }
+  }
+
+  const osBlock = systemInfo
+    ? `\nTARGET PLATFORM: ${systemInfo}\nThis app is built for this specific platform ONLY. Do NOT flag cross-platform compatibility issues. Platform-specific APIs and env vars (e.g. HOME on macOS/Linux, USERPROFILE on Windows) are acceptable when they match the target. Do NOT suggest adding the dirs crate or other cross-platform abstractions unless the code targets the wrong platform.\n`
+    : "";
+
+  const systemPrompt = `You are a Rust code reviewer. Compilation already passed. Verify each command implements its described behavior — not stubs.
+${osBlock}
+Check each command:
+1. Does it do what the description says? (not returning empty Vec, todo!(), or unimplemented!())
+2. Are correct system APIs used? (std::fs for files, std::process::Command for shell)
+3. Are errors handled with Result/map_err?
+
+Return JSON: { "pass": true/false, "issues": ["issue descriptions"] }
+If correct, return { "pass": true, "issues": [] }.
+Do NOT flag style preferences, cross-platform concerns, or hypothetical edge cases. Only flag real functional problems.`;
+  const userPrompt = `COMMAND SPECS:\n${commandSpecs}\n\nSOURCE CODE (${sourceFile}):\n${commandsRs}`;
+
+  log(`  [verify] Review prompt: system=${systemPrompt.length} chars, user=${userPrompt.length} chars (source from ${sourceFile}, ${commandsRs.split("\n").length} lines)`);
 
   try {
-    const reviewResponse = await retryGenerate(generate,
-      `You are a Rust code reviewer for a Tauri 2 desktop app backend. Compilation has already passed. Now verify that each command ACTUALLY implements the described behavior — not just compiles.
-
-Check:
-1. Does each command do what its description says? (e.g., "list files" actually lists files, not returns empty vec)
-2. Are there placeholder/stub implementations? (e.g., Ok(Vec::new()) when it should scan a directory, todo!(), unimplemented!(), empty match arms)
-3. Are error cases handled? (permission denied, path not found, etc.)
-4. Are the correct system APIs used? (std::fs for files, std::process::Command for shell, etc.)
-5. Does main.rs register ALL commands in generate_handler![]?
-
-Return JSON:
-{ "pass": true/false, "issues": ["specific issue descriptions"] }
-
-If everything is correctly implemented, return { "pass": true, "issues": [] }.
-Be strict — stubs that compile but don't do real work must be flagged.`,
-      `USER REQUEST:\n${conversation}\n\nCOMMAND SPECS:\n${commandSpecs}\n\ncommands.rs:\n${commandsRs}\n\nmain.rs:\n${mainRs}`,
-      10,
-    );
+    const t0 = Date.now();
+    const reviewResponse = await retryGenerate(generate, systemPrompt, userPrompt, 3);
+    log(`  [verify] Review response (${Date.now() - t0}ms, ${reviewResponse.length} chars): ${reviewResponse.slice(0, 500)}`);
 
     const jsonMatch = reviewResponse.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      const review = JSON.parse(jsonMatch[0]) as { pass: boolean; issues: string[] };
-      if (review.pass) {
+      const review = JSON.parse(jsonMatch[0]);
+      const pass = typeof review?.pass === "boolean" ? review.pass : false;
+      const issues = Array.isArray(review?.issues) ? review.issues.filter((s: unknown) => typeof s === "string") : [];
+      if (pass) {
         log("  [verify] Semantic review PASSED");
         return "OK: Compilation passed and all commands correctly implement the required behavior.";
       }
-      const issueList = review.issues.map((s: string, i: number) => `${i + 1}. ${s}`).join("\n");
-      log(`  [verify] Semantic review — ${review.issues.length} issue(s)`);
+      const issueList = issues.map((s: string, i: number) => `${i + 1}. ${s}`).join("\n");
+      log(`  [verify] Semantic review — ${issues.length} issue(s):`);
+      log(issueList);
       return `COMPILATION PASSED but code review found issues:\n${issueList}\n\nFix these issues, then call verify again.`;
     }
 
-    log("  [verify] Could not parse review — treating as pass");
+    log("  [verify] Could not parse review JSON — treating as pass");
     return "OK: Compilation passed. (Semantic review inconclusive — proceed.)";
   } catch (err) {
     log(`  [verify] Semantic review failed: ${err}`);
@@ -1196,7 +1316,7 @@ export async function runRustAgentLoop(config: RustAgentConfig): Promise<RustAge
       // verify is handled here (not in executeRustTool) since it needs generate + conversation
       if (call.tool === "verify") {
         onLog("  [verify] Running cargo check + semantic review...");
-        const verifyResult = await runRustVerify(projectId, fileState, commandSpecs, conversation, generate, onLog);
+        const verifyResult = await runRustVerify(projectId, fileState, commandSpecs, conversation, generate, onLog, config.systemInfo);
         results.push(`[verify] ${verifyResult}`);
         continue;
       }
@@ -1257,6 +1377,11 @@ async function executeRustTool(
       if (!path || search === undefined || replace === undefined) {
         return "Error: 'path', 'search', 'replace' required";
       }
+      // Block edits to tauri.conf.json — it's managed by the build system
+      if (path === "src-tauri/tauri.conf.json" || path.endsWith("/tauri.conf.json")) {
+        log(`  [edit_file] ${path} — BLOCKED (protected config)`);
+        return "Error: src-tauri/tauri.conf.json is managed by the build system and cannot be edited. The frontendDist, productName, and other Tauri config values are set automatically.";
+      }
       let content = fileState.get(path);
       if (content === undefined) {
         try {
@@ -1283,6 +1408,11 @@ async function executeRustTool(
       const path = args.path as string;
       const content = args.content as string;
       if (!path || content === undefined) return "Error: 'path' and 'content' required";
+      // Block writes to tauri.conf.json — it's managed by the build system
+      if (path === "src-tauri/tauri.conf.json" || path.endsWith("/tauri.conf.json")) {
+        log(`  [write_file] ${path} — BLOCKED (protected config)`);
+        return "Error: src-tauri/tauri.conf.json is managed by the build system and cannot be overwritten.";
+      }
       fileState.set(path, content);
       await writeProjectFile(projectId, path, content);
       log(`  [write_file] ${path} — OK (${content.split("\n").length} lines)`);

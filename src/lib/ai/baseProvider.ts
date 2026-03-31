@@ -73,7 +73,11 @@ function isTransientError(err: unknown): boolean {
     lower.includes("502") ||
     lower.includes("504") ||
     lower.includes("overloaded") ||
-    lower.includes("rate limit")
+    lower.includes("rate limit") ||
+    lower.includes("cannot parse") ||
+    lower.includes("parse error") ||
+    lower.includes("unexpected end of json") ||
+    lower.includes("invalid json")
   );
 }
 
@@ -184,7 +188,9 @@ export function createProvider(
         if (parsed && typeof parsed.intent === "string" && typeof parsed.message === "string") {
           return {
             intent: parsed.intent,
-            confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.5,
+            confidence: typeof parsed.confidence === "number" && Number.isFinite(parsed.confidence)
+              ? Math.max(0, Math.min(1, parsed.confidence))
+              : 0.5,
             summary: typeof parsed.summary === "string" ? parsed.summary : "",
             message: parsed.message,
             layoutArchetype: typeof parsed.layoutArchetype === "string" ? parsed.layoutArchetype as LayoutArchetype : undefined,
@@ -423,19 +429,31 @@ export function createProvider(
       }
     },
 
-    async suggestAppNames({ messages }): Promise<string[]> {
+    async suggestAppNames({ messages }): Promise<{ autoDetected: string | null; suggestions: string[] }> {
       const conversation = formatMessages(messages);
       const prompt = buildSuggestAppNames(conversation);
 
       try {
         const text = await adapter.generate(prompt.system, prompt.user, { model: "fast" });
         const parsed = JSON.parse(text.trim());
-        if (Array.isArray(parsed) && parsed.every((n: unknown) => typeof n === "string")) {
-          return parsed.slice(0, 5);
+
+        // New format: { autoDetected: string | null, suggestions: string[] }
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const autoDetected = typeof parsed.autoDetected === "string" ? parsed.autoDetected : null;
+          const suggestions = Array.isArray(parsed.suggestions)
+            ? parsed.suggestions.filter((n: unknown) => typeof n === "string").slice(0, 5)
+            : [];
+          return { autoDetected, suggestions };
         }
-        return [];
+
+        // Fallback: old format (plain array) — treat as suggestions
+        if (Array.isArray(parsed) && parsed.every((n: unknown) => typeof n === "string")) {
+          return { autoDetected: null, suggestions: parsed.slice(0, 5) };
+        }
+
+        return { autoDetected: null, suggestions: [] };
       } catch {
-        return [];
+        return { autoDetected: null, suggestions: [] };
       }
     },
 

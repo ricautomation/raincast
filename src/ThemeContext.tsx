@@ -23,13 +23,15 @@ const STORAGE_KEY = "raincast-appearance";
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [appearance, setAppearanceState] = useState<Appearance>(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved === "ocean" || saved === "sunset" || saved === "aurora" || saved === "midnight") return saved;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved === "ocean" || saved === "sunset" || saved === "aurora" || saved === "midnight") return saved;
+    } catch { /* localStorage unavailable — use default */ }
     return "ocean";
   });
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, appearance);
+    try { localStorage.setItem(STORAGE_KEY, appearance); } catch { /* quota or disabled */ }
     const el = document.documentElement;
     el.classList.add("theme-transitioning");
     el.setAttribute("data-appearance", appearance);

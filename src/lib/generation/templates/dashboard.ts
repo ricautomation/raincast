@@ -6,9 +6,10 @@ export const dashboard: LayoutTemplate = {
   name: "Dashboard",
   description: "Analytics, monitoring, admin panel with rounded sidebar and card grid",
   keywords: [
-    "dashboard", "analytics", "monitoring", "admin", "panel", "metrics",
-    "stats", "statistics", "overview", "chart", "graph", "widget", "kpi",
-    "report", "home automation", "control panel", "system monitor",
+    "dashboard", "analytics", "admin", "admin panel", "panel",
+    "metrics dashboard", "stats dashboard", "statistics overview",
+    "overview dashboard", "kpi dashboard",
+    "report", "home automation", "control panel",
   ],
   appShell: `\
 import { useState } from "react";

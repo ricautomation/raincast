@@ -34,36 +34,31 @@ struct ShipHandle {
 
 struct ShipCancelState(Mutex<HashMap<String, ShipHandle>>);
 
-// ── Blue-Engine State ──
-
-struct BlueEngineProcess {
-    child: Child,
-    port: u16,
-    invoke_key: String,
-    /// Handle for the stderr log-streaming thread (if any).
-    _log_thread: Option<std::thread::JoinHandle<()>>,
-}
-
-struct BlueEngineState(Mutex<HashMap<String, BlueEngineProcess>>);
 
 const MAX_LOG_LINES: usize = 200;
 
 /// Spawn a thread that reads lines from a reader and appends to a shared buffer.
+/// Wrapped in catch_unwind so a panic here doesn't poison the shared mutex.
 fn spawn_log_reader<R: std::io::Read + Send + 'static>(reader: R, buf: LogBuffer) {
     std::thread::spawn(move || {
-        let br = BufReader::new(reader);
-        for line in br.lines() {
-            match line {
-                Ok(l) => {
-                    if let Ok(mut v) = buf.lock() {
-                        v.push(l);
-                        if v.len() > MAX_LOG_LINES {
-                            v.remove(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let br = BufReader::new(reader);
+            for line in br.lines() {
+                match line {
+                    Ok(l) => {
+                        if let Ok(mut v) = buf.lock() {
+                            v.push(l);
+                            if v.len() > MAX_LOG_LINES {
+                                v.remove(0);
+                            }
                         }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
+        }));
+        if let Err(e) = result {
+            eprintln!("[spawn_log_reader] thread panicked: {:?}", e);
         }
     });
 }
@@ -840,10 +835,11 @@ fn bridge_clipboard_write(text: String) -> Result<(), String> {
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Clipboard write failed: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())
-            .map_err(|e| format!("Cannot write to clipboard: {e}"))?;
-    }
+    let mut stdin = child.stdin.take()
+        .ok_or_else(|| "Clipboard write failed: could not capture stdin".to_string())?;
+    stdin.write_all(text.as_bytes())
+        .map_err(|e| format!("Cannot write to clipboard: {e}"))?;
+    drop(stdin); // close stdin so pbcopy processes the input
     child.wait().map_err(|e| format!("Clipboard write failed: {e}"))?;
     Ok(())
 }
@@ -855,6 +851,67 @@ fn bridge_app_info() -> AppInfo {
         name: "Raincast".into(),
         version: env!("CARGO_PKG_VERSION").into(),
     }
+}
+
+// ── Shell / Script Execution ──
+
+#[derive(Serialize)]
+struct RunCommandResult {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run a shell command or AppleScript and return its output.
+#[tauri::command]
+fn bridge_run_command(
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+) -> Result<RunCommandResult, String> {
+    if program.is_empty() {
+        return Err("Program name cannot be empty".into());
+    }
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(ref dir) = cwd {
+        let p = Path::new(dir);
+        if p.exists() && p.is_dir() {
+            cmd.current_dir(p);
+        }
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("Command not found: '{}'. Is it installed and in your PATH?", program)
+            } else {
+                format!("Failed to run '{}': {e}", program)
+            }
+        })?;
+
+    const MAX_OUTPUT: usize = 1_048_576; // 1MB limit
+    let stdout_raw = String::from_utf8_lossy(&output.stdout);
+    let stderr_raw = String::from_utf8_lossy(&output.stderr);
+
+    Ok(RunCommandResult {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: if stdout_raw.len() > MAX_OUTPUT {
+            stdout_raw[..MAX_OUTPUT].to_string()
+        } else {
+            stdout_raw.into_owned()
+        },
+        stderr: if stderr_raw.len() > MAX_OUTPUT {
+            stderr_raw[..MAX_OUTPUT].to_string()
+        } else {
+            stderr_raw.into_owned()
+        },
+    })
 }
 
 // ── Code Editor Detection ──
@@ -879,7 +936,7 @@ fn detect_editors() -> Vec<DetectedEditor> {
             ("cursor", "Cursor", &["/Applications/Cursor.app", "/usr/local/bin/cursor"]),
             ("vscode", "VS Code", &["/Applications/Visual Studio Code.app", "/usr/local/bin/code"]),
             ("zed", "Zed", &["/Applications/Zed.app", "/usr/local/bin/zed"]),
-            ("windsurf", "Windsurf", &["/Applications/Windsurf.app", "/usr/local/bin/windsurf"]),
+            ("antigravity", "Antigravity", &["/Applications/Antigravity.app", "/usr/local/bin/antigravity"]),
             ("idea", "IntelliJ IDEA", &["/Applications/IntelliJ IDEA.app", "/Applications/IntelliJ IDEA CE.app"]),
             ("neovim", "Neovim", &["/usr/local/bin/nvim", "/opt/homebrew/bin/nvim"]),
             ("xcode", "Xcode", &["/Applications/Xcode.app"]),
@@ -912,7 +969,7 @@ fn detect_editors() -> Vec<DetectedEditor> {
             ("cursor", "Cursor", vec![format!("{local}\\Programs\\Cursor\\Cursor.exe")]),
             ("vscode", "VS Code", vec![format!("{local}\\Programs\\Microsoft VS Code\\Code.exe")]),
             ("zed", "Zed", vec![format!("{local}\\Programs\\Zed\\zed.exe")]),
-            ("windsurf", "Windsurf", vec![format!("{local}\\Programs\\Windsurf\\Windsurf.exe")]),
+            ("antigravity", "Antigravity", vec![format!("{local}\\Programs\\Antigravity\\Antigravity.exe")]),
             ("idea", "IntelliJ IDEA", vec![format!("{program_files}\\JetBrains\\IntelliJ IDEA\\bin\\idea64.exe")]),
             ("neovim", "Neovim", vec!["C:\\Program Files\\Neovim\\bin\\nvim.exe".into()]),
             ("xcode", "Xcode", vec![]),
@@ -942,7 +999,7 @@ fn detect_editors() -> Vec<DetectedEditor> {
             ("cursor", "Cursor", &["/usr/bin/cursor", "/usr/local/bin/cursor"]),
             ("vscode", "VS Code", &["/usr/bin/code", "/usr/share/code/code"]),
             ("zed", "Zed", &["/usr/bin/zed", "/usr/local/bin/zed"]),
-            ("windsurf", "Windsurf", &["/usr/bin/windsurf"]),
+            ("antigravity", "Antigravity", &["/usr/bin/antigravity"]),
             ("idea", "IntelliJ IDEA", &["/usr/bin/idea", "/opt/idea/bin/idea.sh"]),
             ("neovim", "Neovim", &["/usr/bin/nvim", "/usr/local/bin/nvim"]),
             ("xcode", "Xcode", &[]),
@@ -1154,8 +1211,10 @@ fn run_streaming_env(
         *guard = Some(pid);
     }
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child.stdout.take()
+        .ok_or_else(|| format!("Failed to capture stdout from {cmd}"))?;
+    let stderr = child.stderr.take()
+        .ok_or_else(|| format!("Failed to capture stderr from {cmd}"))?;
 
     let h1 = handle.clone();
     let p1 = project_id.to_string();
@@ -1182,8 +1241,12 @@ fn run_streaming_env(
     });
 
     let status = child.wait().map_err(|e| format!("Wait failed: {e}"))?;
-    let _ = t1.join();
-    let _ = t2.join();
+    if let Err(e) = t1.join() {
+        eprintln!("[ship] stdout reader thread panicked: {:?}", e);
+    }
+    if let Err(e) = t2.join() {
+        eprintln!("[ship] stderr reader thread panicked: {:?}", e);
+    }
 
     // Clear PID
     if let Ok(mut guard) = ship.current_pid.lock() {
@@ -1209,6 +1272,23 @@ fn seed_tauri_config(app_root: &Path, app_name: &str, project_id: &str) -> Resul
     // (user may have re-generated with a different app name)
     let tauri_conf = tauri_dir.join("tauri.conf.json");
     let bundle_id = format!("com.raincast.shipped.{}", project_id);
+
+    // Read window dimensions from .rain/window.json (written by the generation session)
+    let (win_w, win_h) = {
+        let window_json = app_root.join(".rain/window.json");
+        if let Ok(data) = fs::read_to_string(&window_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                let w = val.get("width").and_then(|v| v.as_u64()).unwrap_or(1200) as u32;
+                let h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(800) as u32;
+                (w.max(200), h.max(150)) // enforce minimum sane size
+            } else {
+                (1200, 800)
+            }
+        } else {
+            (1200, 800)
+        }
+    };
+
     let conf_content = format!(
         r#"{{
   "productName": "{app_name}",
@@ -1222,8 +1302,8 @@ fn seed_tauri_config(app_root: &Path, app_name: &str, project_id: &str) -> Resul
     "windows": [
       {{
         "title": "",
-        "width": 1200,
-        "height": 800,
+        "width": {win_w},
+        "height": {win_h},
         "center": true,
         "transparent": true,
         "decorations": true,
@@ -1231,7 +1311,14 @@ fn seed_tauri_config(app_root: &Path, app_name: &str, project_id: &str) -> Resul
         "hiddenTitle": true,
         "trafficLightPosition": {{ "x": 13, "y": 22 }}
       }}
-    ]
+    ],
+    "security": {{
+      "csp": null,
+      "assetProtocol": {{
+        "enable": true,
+        "scope": ["**"]
+      }}
+    }}
   }},
   "bundle": {{
     "active": true,
@@ -1396,7 +1483,7 @@ fn ship_project(
     // Register it so cancel_ship can find it
     {
         let state = app.state::<ShipCancelState>();
-        let mut map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
+        let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
         map.insert(project_id.clone(), ShipHandle {
             cancelled: Arc::clone(&ship_handle.cancelled),
             current_pid: Arc::clone(&ship_handle.current_pid),
@@ -1418,7 +1505,7 @@ fn cancel_ship(
     project_id: String,
 ) -> Result<(), String> {
     let state = app.state::<ShipCancelState>();
-    let map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let map = state.0.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(handle) = map.get(&project_id) {
         handle.cancelled.store(true, Ordering::Relaxed);
@@ -1426,12 +1513,7 @@ fn cancel_ship(
         // Kill the running child process and its descendants
         if let Ok(guard) = handle.current_pid.lock() {
             if let Some(pid) = *guard {
-                let pid_str = pid.to_string();
-                // Kill children first, then the process itself
-                let _ = Command::new("pkill").args(["-P", &pid_str])
-                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
-                let _ = Command::new("kill").arg(&pid_str)
-                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
+                kill_process_tree(pid);
             }
         }
     }
@@ -1446,12 +1528,10 @@ fn ship_worker(handle: tauri::AppHandle, project_id: String, app_root: PathBuf, 
     // Run the actual work; clean up the cancel state when done
     ship_worker_inner(&handle, &project_id, &app_root, explicit_name, &ship);
 
-    // Clean up the cancel state
-    {
-        let state = h.state::<ShipCancelState>();
-        let mut map = state.0.lock().unwrap();
-        map.remove(&pid);
-    }
+    // Clean up the cancel state (recover from poisoned mutex instead of panicking)
+    let state = h.state::<ShipCancelState>();
+    let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(&pid);
 }
 
 fn ship_worker_inner(handle: &tauri::AppHandle, project_id: &str, app_root: &Path, explicit_name: Option<String>, ship: &ShipHandle) {
@@ -1569,7 +1649,14 @@ fn ship_worker_inner(handle: &tauri::AppHandle, project_id: &str, app_root: &Pat
         return;
     }
 
-    let installed_path = install_dir.join(app_bundle.file_name().unwrap());
+    let bundle_name = match app_bundle.file_name() {
+        Some(name) => name,
+        None => {
+            emit("error", &format!("Invalid app bundle path: {}", app_bundle.display()));
+            return;
+        }
+    };
+    let installed_path = install_dir.join(bundle_name);
     // Remove old installation
     if installed_path.exists() {
         let _ = fs::remove_dir_all(&installed_path);
@@ -1607,6 +1694,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Check whether a shipped .app exists in ~/Applications for this project.
+#[tauri::command]
+fn has_shipped_app(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<bool, String> {
+    let app_root = project_root(&app, &project_id)?.join("app");
+    let app_name = read_app_name(&app_root);
+    let home = std::env::var("HOME").map_err(|_| "Cannot find HOME".to_string())?;
+    let installed = PathBuf::from(&home)
+        .join("Applications")
+        .join(format!("{}.app", app_name));
+    Ok(installed.exists())
 }
 
 /// Launch the shipped .app from ~/Applications.
@@ -1695,8 +1797,10 @@ fn start_preview_server(
     // Stop existing server for this project if any
     let state = app.state::<PreviewState>();
     {
-        let mut map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
+        let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut proc) = map.remove(&project_id) {
+            // Kill entire process tree (npx → node vite → children)
+            kill_process_tree(proc.child.id());
             let _ = proc.child.kill();
             let _ = proc.child.wait();
         }
@@ -1730,7 +1834,7 @@ fn start_preview_server(
     };
 
     {
-        let mut map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
+        let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
         map.insert(project_id, proc);
     }
 
@@ -1743,9 +1847,11 @@ fn stop_preview_server(
     project_id: String,
 ) -> Result<(), String> {
     let state = app.state::<PreviewState>();
-    let mut map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(mut proc) = map.remove(&project_id) {
+        // Kill entire process tree (npx → node vite → children)
+        kill_process_tree(proc.child.id());
         let _ = proc.child.kill();
         let _ = proc.child.wait();
         Ok(())
@@ -1760,7 +1866,7 @@ fn get_preview_logs(
     project_id: String,
 ) -> Result<PreviewLogs, String> {
     let state = app.state::<PreviewState>();
-    let map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let map = state.0.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(proc) = map.get(&project_id) {
         let stdout_tail = proc.stdout_buf.lock()
@@ -1779,192 +1885,141 @@ fn get_preview_logs(
     }
 }
 
-// ── Blue-Engine Commands ──
+// ── Dev Proxy Commands ──
 
-#[derive(Serialize)]
-struct BlueEngineInfo {
-    port: u16,
-    invoke_key: String,
-    commands: Vec<String>,
-}
+/// State tracking compiled proxy binaries per project.
+struct ProxyBinaryState(Mutex<HashMap<String, PathBuf>>);
 
+/// Build the proxy binary for a project from extracted Rust source.
+/// Writes main.rs + Cargo.toml under {project}/.rain/dev-proxy/, compiles it,
+/// and caches the binary path.
 #[tauri::command]
-fn start_blue_engine(
+async fn build_proxy_binary(
     app: tauri::AppHandle,
     project_id: String,
-    port: Option<u16>,
-) -> Result<BlueEngineInfo, String> {
+    main_rs: String,
+    cargo_toml: String,
+) -> Result<String, String> {
     let root = project_root(&app, &project_id)?;
-    let app_root = root.join("app");
+    let proxy_dir = root.join(".rain").join("dev-proxy");
+    let src_dir = proxy_dir.join("src");
 
-    // Stop existing engine for this project
-    {
-        let state = app.state::<BlueEngineState>();
-        let mut map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
-        if let Some(mut proc) = map.remove(&project_id) {
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
-        }
+    // Write source files
+    fs::create_dir_all(&src_dir).map_err(|e| format!("mkdir: {e}"))?;
+    fs::write(src_dir.join("main.rs"), &main_rs).map_err(|e| format!("write main.rs: {e}"))?;
+    fs::write(proxy_dir.join("Cargo.toml"), &cargo_toml).map_err(|e| format!("write Cargo.toml: {e}"))?;
+
+    // Compile the proxy binary
+    let output = Command::new("cargo")
+        .args(["build", "--quiet"])
+        .current_dir(&proxy_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("cargo spawn failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Proxy binary compilation failed:\n{stderr}"));
     }
 
-    // Check if commands.rs exists (system tier app)
-    let commands_rs = app_root.join("src-tauri").join("src").join("commands.rs");
-    if !commands_rs.exists() {
-        return Err("No commands.rs found — this app has no backend commands".into());
+    // Resolve binary path
+    let binary_name = if cfg!(target_os = "windows") { "dev-proxy.exe" } else { "dev-proxy" };
+    let binary_path = proxy_dir.join("target").join("debug").join(binary_name);
+
+    if !binary_path.exists() {
+        return Err("Proxy binary not found after compilation".into());
     }
 
-    let engine_port = match port {
-        Some(p) => p,
-        None => find_free_port()?,
-    };
+    // Cache it
+    let state = app.state::<ProxyBinaryState>();
+    let mut map = state.0.lock().map_err(|e| format!("Lock: {e}"))?;
+    map.insert(project_id.clone(), binary_path.clone());
 
-    // Resolve the blue-engine CLI script
-    // It's installed in the monorepo: packages/blue-engine/dist/cli.js
-    // At runtime, we find it relative to the resource dir or use npx
-    let resource_dir = app.path().resource_dir().map_err(|e| format!("{e}"))?;
-    let engine_script = resource_dir.join("packages").join("blue-engine").join("dist").join("cli.js");
+    Ok(binary_path.to_string_lossy().into_owned())
+}
 
-    // Fallback: try from the workspace root
-    let script_path = if engine_script.exists() {
-        engine_script
-    } else {
-        // Dev mode: relative to the tauri src dir
-        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("packages")
-            .join("blue-engine")
-            .join("dist")
-            .join("cli.js");
-        if dev_path.exists() {
-            dev_path
+/// Execute a command via the project's proxy binary.
+/// The generated app's frontend calls this instead of the actual Tauri command in dev mode.
+#[tauri::command]
+async fn proxy_tauri(
+    app: tauri::AppHandle,
+    project_id: String,
+    command: String,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // Look up the cached binary path, auto-restoring from disk if needed
+    let binary_path = {
+        let state = app.state::<ProxyBinaryState>();
+        let mut map = state.0.lock().map_err(|e| format!("Lock: {e}"))?;
+        if let Some(path) = map.get(&project_id) {
+            path.clone()
         } else {
-            return Err("blue-engine CLI not found. Run `npm run build` in packages/blue-engine.".into());
+            // Cache miss (e.g. after page refresh) — check if binary exists on disk
+            let root = project_root(&app, &project_id)?;
+            let binary_name = if cfg!(target_os = "windows") { "dev-proxy.exe" } else { "dev-proxy" };
+            let disk_path = root.join(".rain").join("dev-proxy").join("target").join("debug").join(binary_name);
+            if disk_path.exists() {
+                map.insert(project_id.clone(), disk_path.clone());
+                disk_path
+            } else {
+                return Err(format!("No proxy binary for project {project_id}. Build it first."));
+            }
         }
     };
 
-    let mut child = Command::new("node")
-        .args([
-            script_path.to_string_lossy().as_ref(),
-            "--project",
-            app_root.to_string_lossy().as_ref(),
-            "--port",
-            &engine_port.to_string(),
-        ])
+    if !binary_path.exists() {
+        return Err("Proxy binary not found on disk — may need to rebuild.".into());
+    }
+
+    // Build the JSON request
+    let request = serde_json::json!({
+        "command": command,
+        "args": args,
+    });
+    let request_str = serde_json::to_string(&request)
+        .map_err(|e| format!("JSON serialize: {e}"))?;
+
+    // Spawn the binary with stdin/stdout piped
+    let mut child = Command::new(&binary_path)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn blue-engine: {e}"))?;
+        .map_err(|e| format!("Spawn proxy binary: {e}"))?;
 
-    // Stream stderr as Tauri events so the frontend can display blue-engine logs
-    let log_thread = if let Some(stderr) = child.stderr.take() {
-        let app_handle = app.clone();
-        let pid = project_id.clone();
-        Some(std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        let _ = app_handle.emit("blue-engine-log", serde_json::json!({
-                            "project_id": pid,
-                            "message": l,
-                        }));
-                    }
-                    Err(_) => break,
-                }
-            }
-        }))
-    } else {
-        None
-    };
+    // Write the request to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(request_str.as_bytes())
+            .map_err(|e| format!("Write to proxy stdin: {e}"))?;
+        // Drop stdin to signal EOF
+    }
 
-    // Read the first line of stdout for the ready JSON
-    let stdout = child.stdout.take().ok_or("No stdout from blue-engine")?;
-    let reader = BufReader::new(stdout);
-    let mut first_line = String::new();
+    // Read stdout
+    let output = child.wait_with_output()
+        .map_err(|e| format!("Wait for proxy: {e}"))?;
 
-    // Read with a timeout (5s)
-    use std::io::Read;
-    let mut stdout_ref = reader.into_inner();
-    let mut buf = [0u8; 4096];
-    let start = std::time::Instant::now();
-    let mut accumulated = String::new();
-
-    loop {
-        if start.elapsed().as_secs() > 10 {
-            let _ = child.kill();
-            return Err("blue-engine startup timed out".into());
-        }
-
-        // Non-blocking read approach: try to read, sleep briefly if nothing
-        // Since we need the first line, read byte by byte or in chunks
-        match stdout_ref.read(&mut buf) {
-            Ok(0) => {
-                let _ = child.kill();
-                return Err("blue-engine exited before ready".into());
-            }
-            Ok(n) => {
-                accumulated.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if let Some(pos) = accumulated.find('\n') {
-                    first_line = accumulated[..pos].to_string();
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(format!("Failed to read blue-engine output: {e}"));
-            }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            return Err(format!("Proxy binary error: {stderr}"));
         }
     }
 
-    // Parse the ready JSON: { "ready": true, "port": N, "invokeKey": "...", "commands": [...] }
-    let info: serde_json::Value = serde_json::from_str(&first_line)
-        .map_err(|e| format!("Invalid blue-engine output: {e}\nGot: {first_line}"))?;
-
-    let actual_port = info["port"].as_u64().unwrap_or(engine_port as u64) as u16;
-    let invoke_key = info["invokeKey"].as_str().unwrap_or("").to_string();
-    let commands: Vec<String> = info["commands"]
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-
-    if invoke_key.is_empty() {
-        let _ = child.kill();
-        return Err("blue-engine did not return an invoke key".into());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Err("Proxy binary returned no output".into());
     }
 
-    // Store the process
-    let state = app.state::<BlueEngineState>();
-    let mut map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
-    map.insert(project_id, BlueEngineProcess {
-        child,
-        port: actual_port,
-        invoke_key: invoke_key.clone(),
-        _log_thread: log_thread,
-    });
+    // Parse the response
+    let response: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Parse proxy output: {e}\nGot: {stdout}"))?;
 
-    Ok(BlueEngineInfo {
-        port: actual_port,
-        invoke_key,
-        commands,
-    })
-}
-
-#[tauri::command]
-fn stop_blue_engine(
-    app: tauri::AppHandle,
-    project_id: String,
-) -> Result<(), String> {
-    let state = app.state::<BlueEngineState>();
-    let mut map = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
-    if let Some(mut proc) = map.remove(&project_id) {
-        let _ = proc.child.kill();
-        let _ = proc.child.wait();
+    if let Some(error) = response.get("error") {
+        return Err(error.as_str().unwrap_or("Unknown proxy error").to_string());
     }
-    Ok(())
+
+    Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
 }
 
 // ── Database Commands ──
@@ -2173,6 +2228,50 @@ fn rename_app_in_source(
     Ok(())
 }
 
+/// Capture a screenshot of a screen region and return it as base64 PNG.
+/// Coordinates are in screen points (top-left origin).
+#[tauri::command]
+fn capture_screenshot(x: f64, y: f64, width: f64, height: f64) -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!("raincast_ss_{}.png", Uuid::new_v4()));
+    let tmp_str = tmp.to_str().ok_or("invalid temp path")?;
+    let rect = format!("{},{},{},{}", x as i32, y as i32, width as i32, height as i32);
+
+    let status = Command::new("screencapture")
+        .args(["-R", &rect, "-x", "-t", "png", tmp_str])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("screencapture failed: {e}"))?;
+
+    if !status.success() {
+        return Err("screencapture returned non-zero".into());
+    }
+
+    let bytes = fs::read(&tmp).map_err(|e| format!("read screenshot: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    Ok(STANDARD.encode(&bytes))
+}
+
+/// Kill a process and all its descendants (children first, then parent).
+/// On Unix, uses pkill -P to find children. Falls back to just killing the PID.
+fn kill_process_tree(pid: u32) {
+    let pid_str = pid.to_string();
+    // Kill children first
+    let _ = Command::new("pkill")
+        .args(["-P", &pid_str])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    // Then kill the parent
+    let _ = Command::new("kill")
+        .arg(&pid_str)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Kill orphaned Vite dev server processes from previous sessions.
 fn kill_orphaned_vite_processes() {
     // Use pkill to kill any leftover `vite` processes spawned by us.
@@ -2190,11 +2289,56 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
         .manage(PreviewState(Mutex::new(HashMap::new())))
-        .manage(BlueEngineState(Mutex::new(HashMap::new())))
+        .manage(ProxyBinaryState(Mutex::new(HashMap::new())))
         .manage(ShipCancelState(Mutex::new(HashMap::new())))
         .setup(|app| {
             // Kill any orphaned Vite processes from previous sessions
             kill_orphaned_vite_processes();
+
+            // Set dock icon in dev mode (bundle icons only apply to built .app)
+            // Delayed so it runs AFTER Tauri finishes its own icon setup
+            #[cfg(all(debug_assertions, target_os = "macos"))]
+            {
+                let icon_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("icons/dev-icon.png");
+                if icon_path.exists() {
+                    println!("[raincast] Setting dock icon from: {}", icon_path.display());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let path_str = match icon_path.to_str() {
+                            Some(s) if !s.is_empty() => s.to_owned(),
+                            _ => {
+                                eprintln!("[raincast] Icon path is not valid UTF-8: {:?}", icon_path);
+                                return;
+                            }
+                        };
+                        let result = std::panic::catch_unwind(|| {
+                            unsafe {
+                                use cocoa::appkit::NSApp;
+                                use cocoa::base::nil;
+                                use cocoa::foundation::NSString;
+                                use objc::*;
+
+                                let ns_path = cocoa::foundation::NSString::alloc(nil)
+                                    .init_str(&path_str);
+                                let image: cocoa::base::id = msg_send![class!(NSImage), alloc];
+                                let image: cocoa::base::id = msg_send![image, initWithContentsOfFile: ns_path];
+                                if image != nil {
+                                    let app = NSApp();
+                                    let _: () = msg_send![app, setApplicationIconImage: image];
+                                    println!("[raincast] Dock icon set successfully");
+                                } else {
+                                    eprintln!("[raincast] Failed to load icon image from: {}", path_str);
+                                }
+                            }
+                        });
+                        if let Err(e) = result {
+                            eprintln!("[raincast] Dock icon setup panicked: {:?}", e);
+                        }
+                    });
+                } else {
+                    println!("[raincast] Icon not found at: {}", icon_path.display());
+                }
+            }
 
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
@@ -2213,8 +2357,6 @@ pub fn run() {
             start_preview_server,
             stop_preview_server,
             get_preview_logs,
-            start_blue_engine,
-            stop_blue_engine,
             bridge_read_file,
             bridge_write_file,
             bridge_delete_file,
@@ -2223,10 +2365,12 @@ pub fn run() {
             bridge_clipboard_read,
             bridge_clipboard_write,
             bridge_app_info,
+            bridge_run_command,
             get_system_info,
             detect_editors,
             open_in_editor,
             ship_project,
+            has_shipped_app,
             launch_shipped_app,
             db_load_all,
             db_create_project,
@@ -2244,7 +2388,56 @@ pub fn run() {
             load_app_icon,
             rename_app_in_source,
             cancel_ship,
+            build_proxy_binary,
+            proxy_tauri,
+            capture_screenshot,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .on_window_event(|window, event| {
+            match event {
+                // Hide instead of close when the user clicks the close button
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                // Kill all preview servers when the window is actually destroyed
+                tauri::WindowEvent::Destroyed => {
+                    let state = window.state::<PreviewState>();
+                    let procs: Vec<_> = {
+                        let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
+                        map.drain().collect()
+                    };
+                    for (_, mut proc) in procs {
+                        let pid = proc.child.id();
+                        kill_process_tree(pid);
+                        let _ = proc.child.kill();
+                        let _ = proc.child.wait();
+                    }
+                }
+                _ => {}
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            match event {
+                // Re-show the window when the user clicks the dock icon (macOS)
+                tauri::RunEvent::Reopen { has_visible_windows, .. } => {
+                    if !has_visible_windows {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                }
+                // Intercept Cmd+Q / app quit — hide instead of exit so the app stays in the dock
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    api.prevent_exit();
+                    // Hide all windows instead of quitting
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
+                _ => {}
+            }
+        });
 }
