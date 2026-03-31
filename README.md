@@ -39,6 +39,27 @@ It generates React + Tauri apps with:
 - **Live preview**:see your app running as it's being built, with hot reload
 - **One-click ship**:compile to a standalone binary you can distribute
 
+## How It Works
+
+You describe what you want, and Raincast generates the full app: React frontend, Rust backend commands, and Tauri config.
+
+The interesting part is how the **live preview** works. Generated apps call Rust backend commands via Tauri's `invoke()` bridge, but in dev mode the full Tauri binary isn't compiled yet. So Raincast builds a **proxy binary**: it parses the generated Rust source using AST extraction to find every `#[tauri::command]` function, then generates a standalone CLI binary that reads JSON from stdin, dispatches to the same functions, and writes JSON to stdout. The frontend's `invoke()` calls get routed through this proxy instead of the real Tauri runtime. This means the preview behaves like the real app: file system access, shell commands, system info all work during development, not just after shipping.
+
+When you hit **Ship**, Raincast compiles the actual Tauri binary with all the real commands baked in. The proxy is only for dev.
+
+### AI Providers
+
+Raincast supports multiple AI backends:
+
+| Provider | Models | Best For |
+|----------|--------|----------|
+| **Anthropic Claude** | Sonnet 4.6 (pro), Haiku 4.5 (fast) | Complex apps, accurate code |
+| **Google Gemini** | 3.1 Pro, 3 Flash | Fast iteration, multimodal |
+
+Bring your own API key. Set it in the app settings.
+
+Want to add **OpenAI Codex**, **xAI Grok**, **DeepSeek**, **Mistral**, or another provider? PRs are welcome:or [open an issue](https://github.com/tihiera/raincast/issues) and we'll prioritize it.
+
 ## Installation
 
 ### macOS
@@ -80,27 +101,6 @@ Or download the `.AppImage` from [Releases](https://github.com/tihiera/raincast/
 - Xcode Command Line Tools (macOS): `xcode-select --install`
 - Linux: `sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev`
 
-## How It Works
-
-You describe what you want, and Raincast generates the full app: React frontend, Rust backend commands, and Tauri config.
-
-The interesting part is how the **live preview** works. Generated apps call Rust backend commands via Tauri's `invoke()` bridge, but in dev mode the full Tauri binary isn't compiled yet. So Raincast builds a **proxy binary**: it parses the generated Rust source using AST extraction to find every `#[tauri::command]` function, then generates a standalone CLI binary that reads JSON from stdin, dispatches to the same functions, and writes JSON to stdout. The frontend's `invoke()` calls get routed through this proxy instead of the real Tauri runtime. This means the preview behaves like the real app: file system access, shell commands, system info all work during development, not just after shipping.
-
-When you hit **Ship**, Raincast compiles the actual Tauri binary with all the real commands baked in. The proxy is only for dev.
-
-### AI Providers
-
-Raincast supports multiple AI backends:
-
-| Provider | Models | Best For |
-|----------|--------|----------|
-| **Anthropic Claude** | Sonnet 4.6 (pro), Haiku 4.5 (fast) | Complex apps, accurate code |
-| **Google Gemini** | 3.1 Pro, 3 Flash | Fast iteration, multimodal |
-
-Bring your own API key. Set it in the app settings.
-
-Want to add **OpenAI Codex**, **xAI Grok**, **DeepSeek**, **Mistral**, or another provider? PRs are welcome:or [open an issue](https://github.com/tihiera/raincast/issues) and we'll prioritize it.
-
 ## Examples
 
 <details>
@@ -117,7 +117,7 @@ Compact, single-purpose tools with frosted glass windows.
 <details>
 <summary><strong>Full Applications</strong></summary>
 
-**"Build a local AI chat app that downloads and compiles [llama.cpp](https://github.com/ggml-org/llama.cpp) on first launch. Chat interface with streamed responses, a model picker, and a collapsible dev console showing setup logs and server status."**
+**"Build a local AI chat app that connects to a [llama.cpp](https://github.com/ggml-org/llama.cpp) server running on my machine. Chat interface with streamed responses, a model picker, and a collapsible dev console showing connection status and server logs."**
 
 ![Local AI Chat](assets/chat.png)
 
@@ -127,6 +127,8 @@ Compact, single-purpose tools with frosted glass windows.
 <summary><strong>Games</strong></summary>
 
 **"Build a side-scrolling platformer inspired by Super Mario. Pixel-art style sprites with vibrant colors, parallax scrolling backgrounds with gradient skies, a HUD with score, coins, and lives, particle effects on coin collection, and screen shake on damage."**
+
+![Super Mario](assets/mario-vid.gif)
 
 </details>
 
