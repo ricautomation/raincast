@@ -57,6 +57,10 @@ cd "$BUILD_DIR"
 echo "→ Installing dependencies..."
 npm install
 
+echo "→ Building local packages..."
+cd packages/editkit && npm run build && cd ../..
+cd packages/webtools && npm run build && cd ../..
+
 echo "→ Building $APP_NAME (this may take a few minutes)..."
 npm run tauri build 2>&1 | tail -5
 
