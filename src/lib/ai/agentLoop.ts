@@ -405,7 +405,7 @@ async function executeTool(
           return "No results found.";
         }
         log(`  [web_search] "${query}" — ${results.length} result(s)`);
-        return results.map((r, i) => `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.snippet}`).join("\n\n");
+        return results.map((r: { title: string; url: string; snippet: string }, i: number) => `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.snippet}`).join("\n\n");
       } catch (err) {
         log(`  [web_search] "${query}" — FAILED: ${err}`);
         return `Error: Web search failed — ${err instanceof Error ? err.message : String(err)}`;
@@ -443,12 +443,12 @@ async function executeTool(
           maxContentLength: 15000,
           timeoutMs: 10000,
           fetchFn,
-          onPage: (pageUrl, wordCount, depth) => {
+          onPage: (pageUrl: string, wordCount: number, depth: number) => {
             log(`  [web_crawl] depth=${depth} ${pageUrl} — ${wordCount} words`);
           },
         });
         log(`  [web_crawl] Done: ${result.pages.length} pages, ${result.totalWords} words, ${result.elapsedMs}ms`);
-        const summary = result.pages.map((p) => `- ${p.title || p.url} (${p.wordCount} words)`).join("\n");
+        const summary = result.pages.map((p: { title?: string; url: string; wordCount: number }) => `- ${p.title || p.url} (${p.wordCount} words)`).join("\n");
         return `# Crawl results for: ${query}\n\nStarting URL: ${url}\nPages fetched: ${result.pages.length}\nTotal words: ${result.totalWords}\n\n## Pages found:\n${summary}\n\n---\n\n${result.content}`;
       } catch (err) {
         log(`  [web_crawl] ${url} — FAILED: ${err}`);

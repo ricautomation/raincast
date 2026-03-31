@@ -1,0 +1,28 @@
+{
+  "name": "@rain/webtools",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./search": "./dist/search.js",
+    "./fetch": "./dist/fetch.js",
+    "./crawl": "./dist/crawl.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit",
+    "bench": "vitest run tests/benchmark.test.ts --reporter=verbose"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0"
+  }
+}
