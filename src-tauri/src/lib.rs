@@ -2419,25 +2419,32 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            match event {
-                // Re-show the window when the user clicks the dock icon (macOS)
-                tauri::RunEvent::Reopen { has_visible_windows, .. } => {
-                    if !has_visible_windows {
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+            #[cfg(target_os = "macos")]
+            {
+                match event {
+                    // Re-show the window when the user clicks the dock icon (macOS)
+                    tauri::RunEvent::Reopen { has_visible_windows, .. } => {
+                        if !has_visible_windows {
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
                         }
                     }
-                }
-                // Intercept Cmd+Q / app quit — hide instead of exit so the app stays in the dock
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    api.prevent_exit();
-                    // Hide all windows instead of quitting
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.hide();
+                    // Intercept Cmd+Q / app quit — hide instead of exit so the app stays in the dock
+                    tauri::RunEvent::ExitRequested { api, .. } => {
+                        api.prevent_exit();
+                        // Hide all windows instead of quitting
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (&app_handle, &event);
             }
         });
 }
