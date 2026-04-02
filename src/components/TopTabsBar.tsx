@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { KeyRound, Palette, Eye, EyeOff, ChevronRight, Clock } from "lucide-react";
+import { KeyRound, Palette, Eye, EyeOff, ChevronRight } from "lucide-react";
 import { useAppearance, APPEARANCES, type Appearance } from "../ThemeContext";
 import { useProjectContext } from "../lib/project/ProjectContext";
 import { getActiveProviderId, setActiveProviderId } from "../lib/ai/settings";
@@ -604,266 +604,11 @@ function AppearanceSlider({ onClose }: { onClose: () => void }) {
   );
 }
 
-/* ── Delete confirmation modal ── */
-function DeleteConfirmModal({ projectTitle, onConfirm, onCancel }: {
-  projectTitle: string;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 200,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: "rgba(0,0,0,0.25)",
-        backdropFilter: "blur(4px)",
-        WebkitBackdropFilter: "blur(4px)",
-      }}
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}
-    >
-      <div
-        data-no-drag
-        style={{
-          width: 320,
-          padding: "20px 22px 18px",
-          background: "var(--popover-bg)",
-          borderRadius: 16,
-          boxShadow: "0 12px 40px rgba(0,0,0,0.15)",
-          border: "1px solid var(--popover-border)",
-        }}
-      >
-        <p style={{ fontSize: 15, fontWeight: 600, color: "var(--popover-text)", marginBottom: 8 }}>
-          Delete permanently?
-        </p>
-        <p style={{ fontSize: 13, color: "var(--popover-text-secondary)", lineHeight: 1.5, marginBottom: 18 }}>
-          <strong style={{ color: "var(--popover-text)" }}>{projectTitle}</strong> and all its chat messages will be gone forever.
-        </p>
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <button
-            type="button"
-            onClick={onCancel}
-            style={{
-              padding: "6px 14px",
-              fontSize: 13,
-              fontWeight: 500,
-              borderRadius: 8,
-              border: "1px solid var(--popover-border)",
-              background: "transparent",
-              color: "var(--popover-text-secondary)",
-              cursor: "pointer",
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            style={{
-              padding: "6px 14px",
-              fontSize: 13,
-              fontWeight: 600,
-              borderRadius: 8,
-              border: "none",
-              background: "#e53935",
-              color: "#fff",
-              cursor: "pointer",
-            }}
-          >
-            Delete
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── Project history popup ── */
-function ProjectHistoryPopup({ onClose }: { onClose: () => void }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const { allProjects, activeId, switchProject, deleteProject } = useProjectContext();
-  const [hoveredId, setHoveredId] = useState<string | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<{ id: string; title: string } | null>(null);
-
-  useEffect(() => {
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        // Don't close popup if the delete confirm modal is open — the modal
-        // is rendered outside the popup ref, so clicks on it look "outside"
-        if (confirmDelete) return;
-        onClose();
-      }
-    }
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, [onClose, confirmDelete]);
-
-  // Sort by creation time, newest first
-  const sorted = [...allProjects].sort((a, b) => b.createdAt - a.createdAt);
-
-  return (
-    <>
-      <div
-        ref={ref}
-        data-no-drag
-        className="rain-scroll"
-        style={{
-          position: "absolute",
-          top: 36,
-          right: 0,
-          width: 280,
-          maxHeight: 380,
-          overflowY: "auto",
-          padding: "8px 6px",
-          background: "var(--popover-bg)",
-          borderRadius: 14,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.10), 0 2px 8px rgba(0,0,0,0.06)",
-          border: "1px solid var(--popover-border)",
-          zIndex: 100,
-        }}
-      >
-        <p style={{
-          fontSize: 11,
-          fontWeight: 600,
-          color: "var(--text-secondary)",
-          marginBottom: 6,
-          paddingLeft: 8,
-          letterSpacing: "0.04em",
-          textTransform: "uppercase",
-        }}>
-          Projects
-        </p>
-
-        {sorted.map((project) => {
-          const isActive = project.id === activeId && project.open;
-          const isClosed = !project.open;
-          const isHovered = project.id === hoveredId;
-
-          return (
-            <div
-              key={project.id}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 2,
-                borderRadius: 10,
-                background: isActive ? "var(--subtle-bg)" : isHovered ? "var(--subtle-bg)" : "transparent",
-                transition: "background 150ms ease",
-              }}
-              onMouseEnter={() => setHoveredId(project.id)}
-              onMouseLeave={() => setHoveredId(null)}
-            >
-              <button
-                type="button"
-                onClick={() => { switchProject(project.id); onClose(); }}
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 2,
-                  flex: 1,
-                  minWidth: 0,
-                  padding: "8px 6px 8px 10px",
-                  border: "none",
-                  background: "transparent",
-                  cursor: "pointer",
-                  textAlign: "left",
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  {project.icon ? (
-                    <img
-                      src={project.icon}
-                      alt=""
-                      style={{
-                        width: 14,
-                        height: 14,
-                        borderRadius: 3,
-                        objectFit: "cover",
-                        flexShrink: 0,
-                      }}
-                    />
-                  ) : (
-                    <div style={{
-                      width: 6,
-                      height: 6,
-                      borderRadius: "50%",
-                      background: isActive ? "var(--slider-thumb)" : "transparent",
-                      flexShrink: 0,
-                    }} />
-                  )}
-                  <span style={{
-                    fontSize: 13,
-                    fontWeight: isActive ? 600 : 500,
-                    color: isClosed ? "var(--text-secondary)" : "var(--text-primary)",
-                    flex: 1,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}>
-                    {project.title}
-                  </span>
-                </div>
-              </button>
-
-              {/* Delete button — visible on hover */}
-              <button
-                type="button"
-                title="Delete project"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setConfirmDelete({ id: project.id, title: project.title });
-                }}
-                style={{
-                  width: 24,
-                  height: 24,
-                  borderRadius: 6,
-                  border: "none",
-                  background: "transparent",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  flexShrink: 0,
-                  marginRight: 6,
-                  opacity: isHovered ? 1 : 0,
-                  transition: "opacity 100ms ease, background 100ms ease, color 100ms ease",
-                  color: "var(--text-tertiary)",
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(229,57,53,0.08)"; e.currentTarget.style.color = "#e53935"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-tertiary)"; }}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
-                </svg>
-              </button>
-            </div>
-          );
-        })}
-      </div>
-
-      {confirmDelete && (
-        <DeleteConfirmModal
-          projectTitle={confirmDelete.title}
-          onConfirm={() => {
-            deleteProject(confirmDelete.id);
-            setConfirmDelete(null);
-          }}
-          onCancel={() => setConfirmDelete(null)}
-        />
-      )}
-    </>
-  );
-}
-
 /* ── Main component ── */
 export default function TopTabsBar() {
   const { active } = useProjectContext();
   const [showAppearance, setShowAppearance] = useState(false);
   const [showApiKeys, setShowApiKeys] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
 
   const handleDrag = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
@@ -919,31 +664,10 @@ export default function TopTabsBar() {
 
       {/* Right-side buttons */}
       <div className="flex items-center gap-2 relative" data-no-drag>
-        {/* Project History */}
-        <button
-          type="button"
-          onClick={() => { setShowHistory((v) => !v); setShowApiKeys(false); setShowAppearance(false); }}
-          className="inline-flex items-center justify-center rounded-lg"
-          style={{
-            width: 28,
-            height: 28,
-            color: "var(--icon-color)",
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.background = "var(--icon-hover-bg)";
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = "transparent";
-          }}
-          title="Project History"
-        >
-          <Clock size={15} strokeWidth={1.8} />
-        </button>
-
         {/* API Key */}
         <button
           type="button"
-          onClick={() => { setShowApiKeys((v) => !v); setShowAppearance(false); setShowHistory(false); }}
+          onClick={() => { setShowApiKeys((v) => !v); setShowAppearance(false); }}
           className="inline-flex items-center justify-center rounded-lg"
           style={{
             width: 28,
@@ -964,7 +688,7 @@ export default function TopTabsBar() {
         {/* Appearance */}
         <button
           type="button"
-          onClick={() => { setShowAppearance((v) => !v); setShowApiKeys(false); setShowHistory(false); }}
+          onClick={() => { setShowAppearance((v) => !v); setShowApiKeys(false); }}
           className="inline-flex items-center justify-center rounded-lg"
           style={{
             width: 28,
@@ -982,9 +706,6 @@ export default function TopTabsBar() {
           <Palette size={15} strokeWidth={1.8} />
         </button>
 
-        {showHistory && (
-          <ProjectHistoryPopup onClose={() => setShowHistory(false)} />
-        )}
         {showApiKeys && (
           <ApiKeyModal onClose={() => setShowApiKeys(false)} />
         )}

@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import path from "node:path";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -8,6 +9,17 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [tailwindcss(), react()],
+
+  // Resolve monorepo packages from source in dev mode
+  resolve: {
+    alias: [
+      { find: "@rain/editkit/core", replacement: path.resolve(__dirname, "../packages/editkit/src/core.ts") },
+      { find: "@rain/editkit/browser", replacement: path.resolve(__dirname, "../packages/editkit/src/browser.ts") },
+      { find: "@rain/editkit/prompts", replacement: path.resolve(__dirname, "../packages/editkit/src/prompts.ts") },
+      { find: "@rain/editkit", replacement: path.resolve(__dirname, "../packages/editkit/src/index.ts") },
+      { find: "@rain/webtools", replacement: path.resolve(__dirname, "../packages/webtools/src/index.ts") },
+    ],
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

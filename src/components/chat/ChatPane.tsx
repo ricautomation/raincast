@@ -1,5 +1,5 @@
 import { useRef, useCallback, useState, useEffect, useMemo } from "react";
-import { SquarePen, ChevronDown } from "lucide-react";
+import { SquarePen, ChevronDown, Menu } from "lucide-react";
 import ProviderSelector from "./ProviderSelector";
 import UserBubble from "./UserBubble";
 import AiResponse from "./AiResponse";
@@ -392,6 +392,254 @@ function ToolCallStatus({ status, resultAnim }: { status: ToolStatus; resultAnim
   );
 }
 
+/* ── Delete confirmation modal ── */
+function DeleteConfirmModal({ projectTitle, onConfirm, onCancel }: {
+  projectTitle: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 200,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "rgba(0,0,0,0.25)",
+        backdropFilter: "blur(4px)",
+        WebkitBackdropFilter: "blur(4px)",
+      }}
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}
+    >
+      <div
+        style={{
+          width: 320,
+          padding: "20px 22px 18px",
+          background: "var(--popover-bg)",
+          borderRadius: 16,
+          boxShadow: "0 12px 40px rgba(0,0,0,0.15)",
+          border: "1px solid var(--popover-border)",
+        }}
+      >
+        <p style={{ fontSize: 15, fontWeight: 600, color: "var(--popover-text)", marginBottom: 8 }}>
+          Delete permanently?
+        </p>
+        <p style={{ fontSize: 13, color: "var(--popover-text-secondary)", lineHeight: 1.5, marginBottom: 18 }}>
+          <strong style={{ color: "var(--popover-text)" }}>{projectTitle}</strong> and all its chat messages will be gone forever.
+        </p>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button
+            type="button"
+            onClick={onCancel}
+            style={{
+              padding: "6px 14px",
+              fontSize: 13,
+              fontWeight: 500,
+              borderRadius: 8,
+              border: "1px solid var(--popover-border)",
+              background: "transparent",
+              color: "var(--popover-text-secondary)",
+              cursor: "pointer",
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            style={{
+              padding: "6px 14px",
+              fontSize: 13,
+              fontWeight: 600,
+              borderRadius: 8,
+              border: "none",
+              background: "#e53935",
+              color: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Project history popup ── */
+function ProjectHistoryPopup({ onClose }: { onClose: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const { allProjects, activeId, switchProject, deleteProject } = useProjectContext();
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ id: string; title: string } | null>(null);
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        if (confirmDelete) return;
+        onClose();
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [onClose, confirmDelete]);
+
+  const sorted = [...allProjects].sort((a, b) => b.createdAt - a.createdAt);
+
+  return (
+    <>
+      <div
+        ref={ref}
+        className="rain-scroll"
+        style={{
+          position: "absolute",
+          top: 36,
+          right: 0,
+          width: 280,
+          maxHeight: 380,
+          overflowY: "auto",
+          padding: "8px 6px",
+          background: "var(--popover-bg)",
+          borderRadius: 14,
+          boxShadow: "0 8px 32px rgba(0,0,0,0.10), 0 2px 8px rgba(0,0,0,0.06)",
+          border: "1px solid var(--popover-border)",
+          zIndex: 100,
+        }}
+      >
+        <p style={{
+          fontSize: 11,
+          fontWeight: 600,
+          color: "var(--text-secondary)",
+          marginBottom: 6,
+          paddingLeft: 8,
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+        }}>
+          Projects
+        </p>
+
+        {sorted.map((project) => {
+          const isActive = project.id === activeId && project.open;
+          const isClosed = !project.open;
+          const isHovered = project.id === hoveredId;
+
+          return (
+            <div
+              key={project.id}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 2,
+                borderRadius: 10,
+                background: isActive ? "var(--subtle-bg)" : isHovered ? "var(--subtle-bg)" : "transparent",
+                transition: "background 150ms ease",
+              }}
+              onMouseEnter={() => setHoveredId(project.id)}
+              onMouseLeave={() => setHoveredId(null)}
+            >
+              <button
+                type="button"
+                onClick={() => { switchProject(project.id); onClose(); }}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 2,
+                  flex: 1,
+                  minWidth: 0,
+                  padding: "8px 6px 8px 10px",
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  textAlign: "left",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  {project.icon ? (
+                    <img
+                      src={project.icon}
+                      alt=""
+                      style={{
+                        width: 14,
+                        height: 14,
+                        borderRadius: 3,
+                        objectFit: "cover",
+                        flexShrink: 0,
+                      }}
+                    />
+                  ) : (
+                    <div style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: "50%",
+                      background: isActive ? "var(--slider-thumb)" : "transparent",
+                      flexShrink: 0,
+                    }} />
+                  )}
+                  <span style={{
+                    fontSize: 13,
+                    fontWeight: isActive ? 600 : 500,
+                    color: isClosed ? "var(--text-secondary)" : "var(--text-primary)",
+                    flex: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}>
+                    {project.title}
+                  </span>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                title="Delete project"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirmDelete({ id: project.id, title: project.title });
+                }}
+                style={{
+                  width: 24,
+                  height: 24,
+                  borderRadius: 6,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
+                  marginRight: 6,
+                  opacity: isHovered ? 1 : 0,
+                  transition: "opacity 100ms ease, background 100ms ease, color 100ms ease",
+                  color: "var(--text-tertiary)",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(229,57,53,0.08)"; e.currentTarget.style.color = "#e53935"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-tertiary)"; }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                </svg>
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {confirmDelete && (
+        <DeleteConfirmModal
+          projectTitle={confirmDelete.title}
+          onConfirm={() => {
+            deleteProject(confirmDelete.id);
+            setConfirmDelete(null);
+          }}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+    </>
+  );
+}
+
 export default function ChatPane() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -400,6 +648,7 @@ export default function ChatPane() {
   const [inputValue, setInputValue] = useState("");
   const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([]);
   const [attachedErrors, setAttachedErrors] = useState<string[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
 
   // Per-tab UI state stored in a map so tabs don't interfere
   const [tabStates, setTabStates] = useState<Record<string, TabState>>({});
@@ -838,7 +1087,7 @@ export default function ChatPane() {
           )}
         </div>
 
-        <div className="flex items-center gap-0.5">
+        <div className="flex items-center gap-0.5 relative">
           <button
             className="w-7 h-7 flex items-center justify-center rounded-lg transition-colors"
             style={{ color: "var(--text-secondary)" }}
@@ -849,6 +1098,19 @@ export default function ChatPane() {
           >
             <SquarePen size={15} strokeWidth={1.8} />
           </button>
+          <button
+            className="w-7 h-7 flex items-center justify-center rounded-lg transition-colors"
+            style={{ color: "var(--text-secondary)" }}
+            onClick={() => setShowHistory((v) => !v)}
+            title="Project history"
+            onMouseEnter={(e) => { e.currentTarget.style.background = "var(--btn-subtle-hover-bg)"; e.currentTarget.style.color = "var(--btn-subtle-hover-text)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-secondary)"; }}
+          >
+            <Menu size={15} strokeWidth={1.8} />
+          </button>
+          {showHistory && (
+            <ProjectHistoryPopup onClose={() => setShowHistory(false)} />
+          )}
         </div>
       </div>
 
